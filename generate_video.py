@@ -2953,6 +2953,7 @@ def main():
         formato='lista' if eh_lista else 'webdoc',
         itens_lista=formato_video.get('itens'),
         ordem_lista=formato_video.get('ordem', 'regressiva'),
+        notas_lista=formato_video.get('notas'),
     )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
