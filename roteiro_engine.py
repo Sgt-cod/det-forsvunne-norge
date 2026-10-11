@@ -630,8 +630,76 @@ Retorne APENAS JSON:
     return _extrair_json(resposta.text)
 
 
+def gerar_estrutura_lista(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
+                          num_itens=7, itens_fornecidos=None, ordem='regressiva'):
+    """
+    Estrutura de vídeo em LISTA ("10 motos que...", "7 comidas que..."): introdução → N itens
+    → desfecho. Devolve o MESMO formato de gerar_estrutura_capitulos (chave 'capitulos' =
+    os itens; 'caso_ancoragem' = o critério da lista), então toda a escrita/crítica/ajuste
+    de tamanho/montagem reaproveita o pipeline dos capítulos sem mudança.
+
+    itens_fornecidos: nomes de itens escolhidos pelo usuário (na ORDEM em que aparecem no
+    vídeo). Se vier, o Gemini NÃO inventa/renomeia — só escreve o que cada item cobre.
+    ordem: 'regressiva' (N→1, o último item mostrado é o nº 1) ou 'crescente' (1→N).
+    """
+    n = len(itens_fornecidos) if itens_fornecidos else num_itens
+    if itens_fornecidos:
+        bloco_itens = ("Os itens JÁ FORAM ESCOLHIDOS pelo criador do canal, na ordem em que aparecem no vídeo. "
+                       "Use EXATAMENTE estes títulos, sem renomear, trocar ou reordenar:\n" +
+                       "\n".join(f"{i + 1}. {t}" for i, t in enumerate(itens_fornecidos)))
+    else:
+        bloco_itens = (f"Escolha VOCÊ os {n} itens. Devem ser reais, específicos e distintos entre si "
+                       f"(nada repetido ou quase igual), e o último item mostrado deve ser o mais forte "
+                       f"ou surpreendente — a lista precisa ter um motivo pra ser vista até o fim.")
+    sentido = ("CONTAGEM REGRESSIVA: o primeiro item mostrado recebe o número {n} e o último recebe o número 1."
+               if ordem == 'regressiva' else
+               "ORDEM CRESCENTE: o primeiro item mostrado recebe o número 1 e o último recebe o número {n}.").format(n=n)
+    prompt = f"""Você é roteirista de vídeos em LISTA pro YouTube. NÃO escreva prosa ainda — apenas o
+esqueleto, em {idioma_conteudo}.
+
+NICHO: {contexto_nicho}
+TEMA DA LISTA: "{tema}"
+{_nota_publico()}
+{bloco_itens}
+{sentido}
+
+Regras:
+- São exatamente {n} itens.
+- O título de cada item é curto (1 a 6 palavras): o NOME do item como aparece num card na tela
+  (ex: o modelo da moto, o nome do prato), nunca uma frase.
+- Em "cobre", diga que fatos CONCRETOS esse item vai usar (ano, número, lugar, característica
+  marcante, curiosidade) e por que ele merece a posição que ocupa na lista.
+- "caso_ancoragem" aqui é o CRITÉRIO da lista: o que qualifica um item pra entrar (1 frase).
+- A introdução abre com um gancho curto ligado ao tema, deixa claro o critério e promete o que
+  vem — sem entregar o item final.
+- O desfecho fecha a lista (retoma o critério, comenta o que os itens têm em comum) e termina
+  provocando o espectador de um jeito específico deste tema (ex: perguntar qual item ele viveu
+  ou qual faltou), não um "e você, o que acha?" genérico.
+
+Retorne APENAS JSON:
+{{
+  "caso_ancoragem": "o critério da lista",
+  "introducao": "o que a introdução deve cobrir",
+  "capitulos": [
+    {{"titulo": "Nome do Item", "cobre": "fatos concretos + por que está nessa posição"}}
+  ],
+  "desfecho": "o que o desfecho deve cobrir"
+}}
+(o array "capitulos" deve ter exatamente {n} itens)"""
+    estrutura = _extrair_json(gemini_generate_fn(prompt).text)
+    itens = estrutura.get('capitulos', [])
+    if itens_fornecidos:  # garante nomes do usuário mesmo se o modelo "melhorar" algum
+        for i, titulo in enumerate(itens_fornecidos):
+            if i < len(itens):
+                itens[i]['titulo'] = titulo
+    if len(itens) != n:
+        raise ValueError(f"estrutura de lista veio com {len(itens)} itens, esperado {n}")
+    return estrutura
+
+
 def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, instrucao_extra,
-                           documento_estilo, palavras_alvo, gemini_generate_fn):
+                           documento_estilo, palavras_alvo, gemini_generate_fn,
+                           formato='webdoc', ordem_lista='regressiva'):
     """
     Escreve a prosa de introdução/capítulos/desfecho reaproveitando gerar_prosa (mesmo
     contrato: dict ordenado {{chave: descrição}} -> um bloco de texto por chave), e
@@ -670,6 +738,17 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
         f"pode ser lida sem perder sentido num vídeo sobre outro tema qualquer, ela é "
         f"genérica demais e precisa ser reescrita com um fato concreto no lugar."
     )
+    if formato == 'lista':
+        n_itens = len(estrutura_capitulos['capitulos'])
+        reforco_densidade = (
+            f"FORMATO LISTA ({n_itens} itens). CRITÉRIO da lista: {caso_ancoragem}\n"
+            f"Cada item é um bloco que abre JÁ NOMEANDO o item e a posição dele (o número por "
+            f"extenso, falado) na primeira frase, porque a tela mostra um card com o número e "
+            f"o nome — a narração e o card precisam dizer a mesma coisa. Os itens têm "
+            f"tamanho parecido entre si (nenhum item é só uma frase). DENSIDADE: cada item traz "
+            f"pelo menos dois fatos específicos (ano, número, lugar, característica) — nada "
+            f"que serviria pra qualquer item. Não anuncie o item seguinte no fim de cada bloco."
+        )
     instrucao_extra_completa = f"{instrucao_extra}\n{reforco_densidade}" if instrucao_extra else reforco_densidade
 
     blocos = gerar_prosa(estrutura_prosa, contexto_nicho, idioma_conteudo, instrucao_extra_completa,
@@ -677,18 +756,28 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
 
     titulos_capitulos = {f'capitulo_{i + 1}': cap['titulo']
                           for i, cap in enumerate(estrutura_capitulos['capitulos'])}
+    n_cap = len(estrutura_capitulos['capitulos'])
     for b in blocos:
         titulo_cap = titulos_capitulos.get(b['bloco'])
         b['titulo_capitulo'] = titulo_cap
         b['inicio_capitulo'] = titulo_cap is not None
+        if formato == 'lista' and titulo_cap is not None:
+            # card com NÚMERO + NOME sobre a mídia do item (sem tela preta nem pausa)
+            idx = int(b['bloco'].split('_')[1]) - 1
+            b['formato_card'] = 'overlay'
+            b['numero_item'] = (n_cap - idx) if ordem_lista == 'regressiva' else (idx + 1)
 
     return blocos
 
 
 def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                                     documento_estilo, tipo_video, gemini_generate_fn,
-                                    num_capitulos=3, palavras_alvo=None):
+                                    num_capitulos=3, palavras_alvo=None,
+                                    formato='webdoc', itens_lista=None, ordem_lista='regressiva'):
     """
+    formato='lista' (ver gerar_estrutura_lista): mesma cadeia, mas os capítulos viram ITENS
+    numerados de uma lista, com card de número+nome sobre a mídia em vez de tela preta.
+
     Modo 'capitulos_webdoc' — formato investigativo em capítulos nomeados, cada um com
     card de transição e música própria. Mesmo contrato de saída de gerar_pacote_roteiro
     (roteiro_texto, roteiro_blocos, titulo, descricao), mais 'capitulos_meta' — lista
@@ -706,15 +795,22 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
 
     try:
         print("  🧱 Estágio 1/4 — estrutura em capítulos...")
-        estrutura = _com_retry_estagio(
-            "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
-            tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos)
+        if formato == 'lista':
+            estrutura = _com_retry_estagio(
+                "Estágio 1/4 (estrutura de lista)", gerar_estrutura_lista,
+                tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
+                num_capitulos, itens_lista, ordem_lista)
+        else:
+            estrutura = _com_retry_estagio(
+                "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
+                tema, contexto_nicho, idioma_conteudo, gemini_generate_fn, num_capitulos)
 
         print("  ✍️ Estágio 2/4 — escrita...")
         blocos = _com_retry_estagio(
             "Estágio 2/4 (escrita)", gerar_prosa_capitulos,
             estrutura, contexto_nicho, idioma_conteudo, instrucao_extra,
-            documento_estilo, palavras_alvo, gemini_generate_fn)
+            documento_estilo, palavras_alvo, gemini_generate_fn,
+            formato, ordem_lista)
 
         print("  🔍 Estágio 3/4 — crítica adversarial...")
         blocos = _com_retry_estagio(
@@ -737,13 +833,18 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             if _CFG['idioma_numeros'] and contem_digitos(b['texto']):
                 print(f"  ⚠️ Bloco '{b['bloco']}' ainda tem dígito após a normalização — revise.")
 
+        tema_meta = tema
+        if formato == 'lista':
+            n_it = len(estrutura['capitulos'])
+            tema_meta = (f"{tema} [FORMATO: vídeo de LISTA com {n_it} itens — o título deve conter "
+                         f"o número {n_it} e dizer o que a lista traz]")
         print("  🏷️ Estágio 4/4 — título e descrição...")
         titulo = _com_retry_estagio(
             "Estágio 4/4 (título)", gerar_titulo_final_simples,
-            tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
         descricao = _com_retry_estagio(
             "Estágio 4/4 (descrição)", gerar_descricao_final_simples,
-            tema, estrutura, idioma_conteudo, gemini_generate_fn)
+            tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
 
         roteiro_texto = " ".join(b['texto'] for b in blocos)
         capitulos_meta = [{'titulo': b['titulo_capitulo'], 'bloco': b['bloco']}
@@ -756,6 +857,7 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             'descricao': descricao,
             'tese': None,
             'modo': 'capitulos_webdoc',
+            'formato': formato,
             'capitulos_meta': capitulos_meta,
         }
     except Exception as e:
@@ -997,7 +1099,8 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 
 def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                           documento_estilo, tipo_video, gemini_generate_fn,
-                          modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None):
+                          modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None,
+                          formato='webdoc', itens_lista=None, ordem_lista='regressiva'):
     """
     Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão), o modo simples
     sem tese/objeção (modo_roteiro='simples'), ou o modo webdoc em capítulos nomeados
@@ -1016,7 +1119,8 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
         return gerar_pacote_roteiro_capitulos(
             tema, contexto_nicho, idioma_conteudo, instrucao_extra, documento_estilo,
             tipo_video, gemini_generate_fn, num_capitulos=num_capitulos,
-            palavras_alvo=palavras_alvo_webdoc
+            palavras_alvo=palavras_alvo_webdoc,
+            formato=formato, itens_lista=itens_lista, ordem_lista=ordem_lista
         )
 
     try:
