@@ -630,8 +630,13 @@ Retorne APENAS JSON:
     return _extrair_json(resposta.text)
 
 
+def _norm_titulo(t):
+    return re.sub(r'\W+', ' ', (t or '').lower()).strip()
+
+
 def gerar_estrutura_lista(tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
-                          num_itens=7, itens_fornecidos=None, ordem='regressiva'):
+                          num_itens=7, itens_fornecidos=None, ordem='regressiva',
+                          notas_itens=None):
     """
     Estrutura de vídeo em LISTA ("10 motos que...", "7 comidas que..."): introdução → N itens
     → desfecho. Devolve o MESMO formato de gerar_estrutura_capitulos (chave 'capitulos' =
@@ -644,9 +649,18 @@ def gerar_estrutura_lista(tema, contexto_nicho, idioma_conteudo, gemini_generate
     """
     n = len(itens_fornecidos) if itens_fornecidos else num_itens
     if itens_fornecidos:
+        notas_itens = (notas_itens or []) + [None] * len(itens_fornecidos)
+        linhas_itens = []
+        for i, t in enumerate(itens_fornecidos):
+            nota = f"  [nota do criador: {notas_itens[i]}]" if notas_itens[i] else ""
+            linhas_itens.append(f"{i + 1}. {t}{nota}")
         bloco_itens = ("Os itens JÁ FORAM ESCOLHIDOS pelo criador do canal, na ordem em que aparecem no vídeo. "
-                       "Use EXATAMENTE estes títulos, sem renomear, trocar ou reordenar:\n" +
-                       "\n".join(f"{i + 1}. {t}" for i, t in enumerate(itens_fornecidos)))
+                       "Esta lista é INEGOCIÁVEL: cada item da saída deve ser EXATAMENTE o item de mesma posição "
+                       "abaixo — NUNCA substitua, funda, renomeie, reordene nem 'melhore' um item, mesmo que você "
+                       "não o conheça ou ache outro mais forte. Se não souber fatos sobre um item, NÃO invente: "
+                       "em \"cobre\" escreva \"POUCA INFORMAÇÃO\" e descreva só o que o nome e a nota do "
+                       "criador permitem afirmar, sem números, datas ou marcas inventados.\n" +
+                       "\n".join(linhas_itens))
     else:
         bloco_itens = (f"Escolha VOCÊ os {n} itens. Devem ser reais, específicos e distintos entre si "
                        f"(nada repetido ou quase igual), e o último item mostrado deve ser o mais forte "
@@ -681,19 +695,28 @@ Retorne APENAS JSON:
   "caso_ancoragem": "o critério da lista",
   "introducao": "o que a introdução deve cobrir",
   "capitulos": [
-    {{"titulo": "Nome do Item", "cobre": "fatos concretos + por que está nessa posição"}}
+    {{"n": 1, "titulo": "Nome do Item (copie exatamente o da posição n)", "cobre": "fatos concretos + por que está nessa posição"}}
   ],
   "desfecho": "o que o desfecho deve cobrir"
 }}
 (o array "capitulos" deve ter exatamente {n} itens)"""
     estrutura = _extrair_json(gemini_generate_fn(prompt).text)
     itens = estrutura.get('capitulos', [])
-    if itens_fornecidos:  # garante nomes do usuário mesmo se o modelo "melhorar" algum
-        for i, titulo in enumerate(itens_fornecidos):
-            if i < len(itens):
-                itens[i]['titulo'] = titulo
     if len(itens) != n:
         raise ValueError(f"estrutura de lista veio com {len(itens)} itens, esperado {n}")
+    if itens_fornecidos:
+        # O modelo ecoa o título de cada posição. Se algum NÃO bate com o que o usuário mandou,
+        # ele trocou/reordenou item: levanta erro e _com_retry_estagio refaz a estrutura inteira
+        # (corrigir só o título deixaria o "cobre" falando de OUTRO item).
+        for i, titulo in enumerate(itens_fornecidos):
+            eco = _norm_titulo(itens[i].get('titulo'))
+            alvo = _norm_titulo(titulo)
+            if eco != alvo and alvo not in eco and eco not in alvo:
+                raise ValueError(f"item {i + 1} veio como \"{itens[i].get('titulo')}\" "
+                                 f"em vez de \"{titulo}\" — modelo trocou o item")
+            itens[i]['titulo'] = titulo
+            if notas_itens and notas_itens[i]:
+                itens[i]['nota'] = notas_itens[i]
     return estrutura
 
 
@@ -718,8 +741,18 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
     concatenar tudo — não é um truque de texto aqui no roteiro.
     """
     estrutura_prosa = {'introducao': estrutura_capitulos['introducao']}
+    n_total = len(estrutura_capitulos['capitulos'])
     for i, cap in enumerate(estrutura_capitulos['capitulos']):
-        estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
+        if formato == 'lista':
+            numero = (n_total - i) if ordem_lista == 'regressiva' else (i + 1)
+            nota = f" Nota do criador sobre o item: {cap['nota']}." if cap.get('nota') else ""
+            estrutura_prosa[f'capitulo_{i + 1}'] = (
+                f'ITEM "{cap["titulo"]}" (número {numero} da lista). Escreva SOMENTE sobre ESTE item '
+                f'exato, com este nome — não troque por outro item nem por um parecido. Não invente '
+                f'fatos: se faltar informação, seja breve e geral em vez de inventar números ou '
+                f'marcas.{nota} Cobertura prevista: {cap["cobre"]}')
+        else:
+            estrutura_prosa[f'capitulo_{i + 1}'] = cap['cobre']
     estrutura_prosa['desfecho'] = estrutura_capitulos['desfecho']
 
     # O caso de ancoragem (ver gerar_estrutura_capitulos) precisa estar visível na
@@ -773,7 +806,8 @@ def gerar_prosa_capitulos(estrutura_capitulos, contexto_nicho, idioma_conteudo, 
 def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                                     documento_estilo, tipo_video, gemini_generate_fn,
                                     num_capitulos=3, palavras_alvo=None,
-                                    formato='webdoc', itens_lista=None, ordem_lista='regressiva'):
+                                    formato='webdoc', itens_lista=None, ordem_lista='regressiva',
+                                    notas_lista=None):
     """
     formato='lista' (ver gerar_estrutura_lista): mesma cadeia, mas os capítulos viram ITENS
     numerados de uma lista, com card de número+nome sobre a mídia em vez de tela preta.
@@ -799,7 +833,7 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             estrutura = _com_retry_estagio(
                 "Estágio 1/4 (estrutura de lista)", gerar_estrutura_lista,
                 tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
-                num_capitulos, itens_lista, ordem_lista)
+                num_capitulos, itens_lista, ordem_lista, notas_lista)
         else:
             estrutura = _com_retry_estagio(
                 "Estágio 1/4 (estrutura)", gerar_estrutura_capitulos,
@@ -1100,7 +1134,8 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
                           documento_estilo, tipo_video, gemini_generate_fn,
                           modo_roteiro='cadeia_completa', num_capitulos=3, palavras_alvo_webdoc=None,
-                          formato='webdoc', itens_lista=None, ordem_lista='regressiva'):
+                          formato='webdoc', itens_lista=None, ordem_lista='regressiva',
+                          notas_lista=None):
     """
     Roda a cadeia completa (modo_roteiro='cadeia_completa', padrão), o modo simples
     sem tese/objeção (modo_roteiro='simples'), ou o modo webdoc em capítulos nomeados
@@ -1120,7 +1155,8 @@ def gerar_pacote_roteiro(tema, contexto_nicho, idioma_conteudo, instrucao_extra,
             tema, contexto_nicho, idioma_conteudo, instrucao_extra, documento_estilo,
             tipo_video, gemini_generate_fn, num_capitulos=num_capitulos,
             palavras_alvo=palavras_alvo_webdoc,
-            formato=formato, itens_lista=itens_lista, ordem_lista=ordem_lista
+            formato=formato, itens_lista=itens_lista, ordem_lista=ordem_lista,
+            notas_lista=notas_lista
         )
 
     try:
