@@ -985,6 +985,101 @@ def revisar_thumbnail_telegram(thumbnail_path, timeout_min=None, legenda_extra="
                      "ou aperta ✅ Aprovar pra manter a atual.")
 
 
+def escolher_formato_telegram(timeout_min=None):
+    """
+    Primeira pergunta da interação: qual a ESTRUTURA do vídeo.
+      • 📽️ Webdoc: introdução → capítulos → desfecho, com card preto entre capítulos
+      • 🔢 Lista ("10 motos que...", "7 comidas que..."): introdução → itens numerados →
+        desfecho, com um card de número + nome do item sobre a mídia (sem tela preta)
+
+    Pra lista, pergunta também: quantos itens, a ordem (regressiva N→1 ou crescente 1→N) e
+    quem escolhe os NOMES dos itens (o pipeline/Gemini, ou você digitando um por linha).
+
+    Devolve {'formato': 'webdoc'} ou
+            {'formato': 'lista', 'num_itens': N, 'ordem': 'regressiva'|'crescente',
+             'itens': [nomes] | None}
+    Timeout/sem Telegram → o formato padrão do config ('formato_video_telegram' →
+    'formato_padrao', normalmente 'webdoc'), então o workflow nunca trava esperando.
+    """
+    cfg = _config().get('formato_video_telegram', {})
+    padrao = {'formato': cfg.get('formato_padrao', 'webdoc')}
+    if not ATIVA_TELEGRAM or not cfg.get('ativo', False):
+        return padrao
+    if timeout_min is None:
+        timeout_min = _timeout_min('formato_video_telegram', 10)
+    espera = timeout_min * 60
+
+    def _perguntar_botoes(texto, botoes):
+        enviar_texto(texto, botoes=botoes)
+        while True:
+            tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+            if tipo is None:
+                return None
+            if tipo == 'callback':
+                return valor
+
+    limpar_filas_pendentes()
+    escolha = _perguntar_botoes("🎬 Qual a estrutura do vídeo?",
+                                [('📽️ Webdoc (capítulos)', 'webdoc'), ('🔢 Lista (itens numerados)', 'lista')])
+    if escolha != 'lista':
+        enviar_texto("👍 Formato: webdoc (introdução → capítulos → desfecho).")
+        return {'formato': 'webdoc'} if escolha == 'webdoc' else padrao
+
+    # ── quantos itens ──
+    enviar_texto("🔢 Quantos itens na lista? Toque num número ou digite (de 3 a 30).",
+                 botoes=[('5', 'n:5'), ('7', 'n:7'), ('10', 'n:10')])
+    num_itens = None
+    while num_itens is None:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+        if tipo is None:
+            num_itens = 7
+        elif tipo == 'callback' and valor.startswith('n:'):
+            num_itens = int(valor[2:])
+        elif tipo == 'mensagem' and valor['tipo'] == 'texto' and valor['texto'].isdigit() \
+                and 3 <= int(valor['texto']) <= 30:
+            num_itens = int(valor['texto'])
+        elif tipo == 'mensagem':
+            enviar_texto("⚠️ Manda só um número de 3 a 30, ou toque num botão.")
+
+    # ── ordem ──
+    escolha = _perguntar_botoes(
+        f"↕️ Ordem dos {num_itens} itens?",
+        [(f'⬇️ Regressiva ({num_itens}→1)', 'regressiva'), (f'⬆️ Crescente (1→{num_itens})', 'crescente')])
+    ordem = escolha if escolha in ('regressiva', 'crescente') else 'regressiva'
+
+    # ── nomes dos itens ──
+    escolha = _perguntar_botoes("📝 Quem escolhe os itens da lista?",
+                                [('🤖 Você escolhe', 'pipeline'), ('✍️ Eu escolho', 'eu')])
+    itens = None
+    if escolha == 'eu':
+        enviar_texto(
+            "✍️ Mande os nomes dos itens, UM POR LINHA, na ORDEM em que vão APARECER no vídeo "
+            f"(a primeira linha aparece primeiro" +
+            (f", e vai ganhar o número {num_itens})." if ordem == 'regressiva' else ", e vai ganhar o número 1).") +
+            "\nSe mandar uma quantidade diferente de linhas, uso a quantidade que você mandar.",
+            botoes=[('🤖 Deixa que eu escolho', 'pipeline')])
+        while True:
+            tipo, valor = _aguardar_callback_ou_midia(timeout_s=espera)
+            if tipo is None or (tipo == 'callback' and valor == 'pipeline'):
+                break
+            if tipo == 'mensagem' and valor['tipo'] == 'texto':
+                linhas = [re.sub(r'^\s*(?:\d+\s*[.):\-]\s*|[-•*]\s*)', '', l).strip()
+                          for l in valor['texto'].splitlines()]
+                linhas = [l for l in linhas if l]
+                if 3 <= len(linhas) <= 30:
+                    itens, num_itens = linhas, len(linhas)
+                    break
+                enviar_texto("⚠️ Preciso de 3 a 30 itens, um por linha.")
+            elif tipo == 'mensagem':
+                enviar_texto("⚠️ Preciso dos nomes em texto, um por linha.")
+
+    resumo = (f"👍 Lista de {num_itens} itens, ordem {ordem}, " +
+              ("itens escolhidos por você:\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(itens))
+               if itens else "itens escolhidos pelo pipeline."))
+    enviar_texto(resumo)
+    return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens}
+
+
 def escolher_tema_telegram(timeout_min=None):
     """
     Pergunta o tema/direcionamento do próximo vídeo, com botão "Nada a sugerir". Texto
