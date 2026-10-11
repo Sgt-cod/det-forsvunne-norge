@@ -1050,12 +1050,14 @@ def escolher_formato_telegram(timeout_min=None):
     # ── nomes dos itens ──
     escolha = _perguntar_botoes("📝 Quem escolhe os itens da lista?",
                                 [('🤖 Você escolhe', 'pipeline'), ('✍️ Eu escolho', 'eu')])
-    itens = None
+    itens, notas = None, None
     if escolha == 'eu':
         enviar_texto(
-            "✍️ Mande os nomes dos itens, UM POR LINHA, na ORDEM em que vão APARECER no vídeo "
+            "✍️ Mande os itens, UM POR LINHA, na ORDEM em que vão APARECER no vídeo "
             f"(a primeira linha aparece primeiro" +
             (f", e vai ganhar o número {num_itens})." if ordem == 'regressiva' else ", e vai ganhar o número 1).") +
+            "\nDica: se o item for pouco conhecido, acrescente uma nota depois de ' | ' pra eu não "
+            "inventar nada. Ex: BonBon Hurlumhej Mix | mix de balas dinamarquês vendido a granel"
             "\nSe mandar uma quantidade diferente de linhas, uso a quantidade que você mandar.",
             botoes=[('🤖 Deixa que eu escolho', 'pipeline')])
         while True:
@@ -1067,7 +1069,9 @@ def escolher_formato_telegram(timeout_min=None):
                           for l in valor['texto'].splitlines()]
                 linhas = [l for l in linhas if l]
                 if 3 <= len(linhas) <= 30:
-                    itens, num_itens = linhas, len(linhas)
+                    itens = [l.split('|', 1)[0].strip() for l in linhas]
+                    notas = [(l.split('|', 1)[1].strip() if '|' in l else None) for l in linhas]
+                    num_itens = len(linhas)
                     break
                 enviar_texto("⚠️ Preciso de 3 a 30 itens, um por linha.")
             elif tipo == 'mensagem':
@@ -1077,7 +1081,7 @@ def escolher_formato_telegram(timeout_min=None):
               ("itens escolhidos por você:\n" + "\n".join(f"{i + 1}. {t}" for i, t in enumerate(itens))
                if itens else "itens escolhidos pelo pipeline."))
     enviar_texto(resumo)
-    return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens}
+    return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens, 'notas': notas}
 
 
 def escolher_tema_telegram(timeout_min=None):
