@@ -101,5 +101,11 @@
     "ativo": true,
     "orientation": "landscape",
     "min_duration": 10
-  }
+  },
+  "formato_video_telegram": {
+    "ativo": true,
+    "timeout_resposta_min": 10,
+    "formato_padrao": "webdoc"
+  },
+  "duracao_card_item": 4.5
 }
