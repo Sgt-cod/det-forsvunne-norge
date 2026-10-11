@@ -50,7 +50,7 @@ from transicoes import TRANSICOES_DISPONIVEIS, transicao_crossfade
 from mockups_visuais import gerar_print_noticia
 from rede_utils import com_watchdog
 from telegram_review import (
-    ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram,
+    ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram, escolher_formato_telegram,
     escolher_destaques_telegram, revisar_thumbnail_telegram, WorkflowCanceladoPeloUsuario,
     perguntar_audio_customizado_telegram, configurar_tradutor,
     escolher_publicacao_telegram, enviar_texto as telegram_enviar_texto,
@@ -235,35 +235,110 @@ configurar_pais(**{k: v for k, v in config.get('contexto_pais', {}).items()})
 IDIOMA_REVISAO_PTBR = bool(config.get('telegram_traducao_ptbr', {}).get('ativo', False))
 
 
-def _traduzir_para_ptbr(textos, com_sugestao=False):
-    """
-    Tradutor injetado no telegram_review: traduz TODOS os textos numa chamada só (1 por
-    segmento, não 1 por clipe) pra PT-BR. Com com_sugestao=True devolve também, em PT-BR,
-    uma sugestão curta do que o clipe deve MOSTRAR (pra você saber que mídia enviar sem
-    ler o idioma do canal).
-    """
+_MARCADORES_PT = {'não', 'que', 'uma', 'para', 'com', 'foi', 'são', 'mas', 'também', 'seu', 'sua',
+                  'dos', 'das', 'nos', 'nas', 'era', 'tinha', 'pelo', 'pela', 'como', 'os', 'as',
+                  'um', 'ao', 'quando', 'ele', 'ela', 'mais', 'muito', 'depois', 'ainda'}
+_MARCADORES_NO = {'og', 'ikke', 'som', 'det', 'til', 'av', 'på', 'ble', 'var', 'har', 'men', 'med',
+                  'seg', 'han', 'hun', 'den', 'denne', 'fra', 'ved', 'også', 'mot', 'hadde',
+                  'etter', 'eller', 'når', 'bare', 'mange', 'hva', 'jeg', 'vi', 'dere', 'dette'}
+
+
+def _parece_portugues(original, traducao):
+    """Barreira contra o defeito 'a tradução veio igual ao original': descarta tradução vazia,
+    idêntica ao texto de origem ou com mais palavras-marcador de norueguês que de português."""
+    if not traducao:
+        return False
+    norm = lambda t: re.sub(r'\W+', ' ', t.lower()).strip()
+    if norm(traducao) == norm(original):
+        return False
+    palavras = norm(traducao).split()
+    return sum(w in _MARCADORES_PT for w in palavras) >= sum(w in _MARCADORES_NO for w in palavras)
+
+
+def _gemini_json(prompt):
+    return json.loads(_extrair_json_resposta(_gemini_generate(prompt).text))
+
+
+def _traduzir_lote(textos, estrito=False):
+    """Só TRADUZ (sem sugestão de mídia na mesma chamada — pedir as duas coisas juntas
+    fazia o modelo devolver o trecho sem traduzir)."""
     itens = json.dumps(list(textos), ensure_ascii=False)
-    extra = ('  "sugestao": uma frase curta em PT-BR dizendo que imagem/vídeo combina com o trecho '
-             '(ex: "vista aérea de um fiorde", "fábrica antiga abandonada"). Evite pedir '
-             'pessoas famosas ou marcas.\n'
-             '  "busca_en": a MESMA sugestão como termo de busca em INGLÊS pra banco de imagens '
-             '(2 a 5 palavras, concreto e visual, ex: "aerial view norwegian fjord").\n') if com_sugestao else ''
-    prompt = f"""Traduza cada texto da lista JSON abaixo ({IDIOMA_CONTEUDO}) para português do Brasil.
-Tradução FIEL e natural, sem resumir nem acrescentar nada; mantenha nomes próprios, e
-escreva números por extenso como estão (não troque por dígitos) se for mais claro.
+    reforco = ("ATENÇÃO: a resposta anterior voltou no idioma original. Cada item DEVE sair em "
+               "português do Brasil — nenhuma palavra do idioma de origem, exceto nomes próprios.\n\n"
+               if estrito else "")
+    prompt = f"""{reforco}Você é tradutor. Traduza para PORTUGUÊS DO BRASIL cada texto da lista JSON abaixo
+(o idioma de origem é {IDIOMA_CONTEUDO}). Tradução fiel e natural, sem resumir nem acrescentar.
+Mantenha só nomes próprios no original.
+
+Exemplo: "Han bodde i Oslo i førti år." -> "Ele morou em Oslo por quarenta anos."
 
 LISTA ({len(textos)} itens):
 {itens}
 
-Retorne APENAS JSON, MESMA ORDEM E QUANTIDADE dos itens:
-{{"traducoes": [{{"pt": "tradução do item",
-{extra}  }}]}}"""
-    dados = json.loads(_extrair_json_resposta(_gemini_generate(prompt).text))
-    traducoes = dados.get('traducoes', [])
-    return [{'pt': (t.get('pt') or '').strip() or None,
-             'sugestao': (t.get('sugestao') or '').strip() or None,
-             'busca_en': (t.get('busca_en') or '').strip() or None}
-            for t in traducoes]
+Responda APENAS com JSON, uma tradução por item, na MESMA ordem e quantidade:
+{{"traducoes": ["tradução do item 1", "tradução do item 2"]}}"""
+    brutas = _gemini_json(prompt).get('traducoes', [])
+    saida = []
+    for t in brutas:
+        saida.append((t.get('pt') if isinstance(t, dict) else t) or '')
+    return [x.strip() for x in saida]
+
+
+def _sugerir_midia(textos_pt):
+    """Sugestão do que o clipe deve MOSTRAR (PT-BR) + termo de busca em inglês pro Pexels."""
+    itens = json.dumps(list(textos_pt), ensure_ascii=False)
+    prompt = f"""Pra cada trecho de narração (em português) abaixo, diga que imagem/vídeo de banco de
+imagens combina com ele. Evite pessoas famosas e marcas.
+
+TRECHOS ({len(textos_pt)} itens):
+{itens}
+
+Responda APENAS com JSON, um objeto por trecho, MESMA ORDEM e quantidade:
+{{"itens": [{{"sugestao": "frase curta em PT-BR, ex: vista aérea de um fiorde",
+"busca_en": "termo de busca em INGLÊS, 2 a 5 palavras concretas e visuais, ex: aerial view norwegian fjord"}}]}}"""
+    return _gemini_json(prompt).get('itens', [])
+
+
+def _traduzir_para_ptbr(textos, com_sugestao=False):
+    """
+    Tradutor injetado no telegram_review: 1 chamada por segmento (não 1 por clipe) pra
+    traduzir; com com_sugestao=True faz uma 2ª chamada, separada, com a sugestão de mídia.
+    Traduções que voltam iguais ao original (ou ainda em norueguês) são refeitas item a
+    item; se ainda falhar, o item fica SEM tradução (None) em vez de repetir o norueguês.
+    """
+    verificar = 'portugu' not in IDIOMA_CONTEUDO.lower()
+    try:
+        pts = _traduzir_lote(textos)
+    except Exception as e:
+        print(f"  ⚠️ Tradução em lote falhou ({e}) — tentando item a item")
+        pts = []
+    pts = (pts + [''] * len(textos))[:len(textos)]
+
+    for i, (orig, trad) in enumerate(zip(textos, pts)):
+        if verificar and not _parece_portugues(orig, trad):
+            try:
+                novo = _traduzir_lote([orig], estrito=True)
+                trad = novo[0] if novo else ''
+            except Exception:
+                trad = ''
+            pts[i] = trad if _parece_portugues(orig, trad) else ''
+            if not pts[i]:
+                print(f"  ⚠️ Tradução do item {i + 1} não saiu em português — item sem tradução")
+
+    sugestoes = [{} for _ in textos]
+    if com_sugestao:
+        try:
+            base = [pt or orig for pt, orig in zip(pts, textos)]
+            sug = _sugerir_midia(base)
+            if len(sug) == len(textos):
+                sugestoes = [x if isinstance(x, dict) else {} for x in sug]
+        except Exception as e:
+            print(f"  ⚠️ Sugestão de mídia indisponível ({e})")
+
+    return [{'pt': pts[i] or None,
+             'sugestao': (sugestoes[i].get('sugestao') or '').strip() or None,
+             'busca_en': (sugestoes[i].get('busca_en') or '').strip() or None}
+            for i in range(len(textos))]
 
 
 def _extrair_json_resposta(texto):
@@ -2071,7 +2146,16 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     clips_legenda = [c.set_start(c.start + padding_inicio) for c in clips_legenda]
     clips_destaque = [c.set_start(c.start + padding_inicio) for c in clips_destaque]
 
-    video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque,
+    # Formato LISTA: card de número + nome do item SOBRE a mídia (sem tela preta, sem pausa).
+    clips_card_item = []
+    b0 = grupo_blocos[0]
+    if b0.get('formato_card') == 'overlay' and b0.get('titulo_capitulo'):
+        dur_card = float(config.get('duracao_card_item', 4.5))
+        clips_card_item = [gerar_card_item_overlay(b0.get('numero_item'), b0['titulo_capitulo'],
+                                                   largura, altura, dur_card)
+                           .set_start(min(0.8, padding_inicio))]
+
+    video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque + clips_card_item,
                                      size=(largura, altura)).set_duration(duracao_segmento)
 
     audio_narr = AudioFileClip(audio_path_seg).set_start(padding_inicio)
@@ -2172,6 +2256,8 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
         if i < len(segmentos) - 1:
             if i == 0 and vinheta_clip:
                 clips_finais.append(vinheta_clip)
+            if segmentos[i + 1][0].get('formato_card') == 'overlay':
+                continue  # lista: o card entra como overlay dentro do próprio item
             titulo_proximo = segmentos[i + 1][0].get('titulo_capitulo', '')
             card = gerar_card_capitulo(titulo_proximo, largura, altura, duracao=duracao_card)
             clips_finais.append(card)
@@ -2267,6 +2353,57 @@ def gerar_card_capitulo(titulo, largura, altura, duracao=None):
     fade = min(0.4, duracao / 4)
     clip = ImageClip(caminho_temp).set_duration(duracao).fadein(fade).fadeout(fade)
     return clip
+
+
+def gerar_card_item_overlay(numero, titulo, largura, altura, duracao=4.5):
+    """
+    Card do item de uma LISTA: faixa translúcida com o número grande e o nome do item,
+    desenhada sobre a mídia (fundo transparente + fade suave). Mesma fonte do card de
+    capítulo/destaque (identidade visual igual).
+    """
+    from moviepy.editor import ImageClip
+
+    img = Image.new('RGBA', (largura, altura), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(img)
+
+    texto_num = f"#{numero}" if numero is not None else ""
+    nome = titulo.upper()
+    largura_max = int(largura * 0.74)
+
+    tam_nome = int(largura / 24)
+    for _ in range(6):
+        fonte_nome = _carregar_fonte_pil_destaque(tam_nome)
+        bb = draw.textbbox((0, 0), nome, font=fonte_nome)
+        if (bb[2] - bb[0]) <= largura_max or tam_nome <= 28:
+            break
+        tam_nome = max(28, int(tam_nome * largura_max / (bb[2] - bb[0])))
+    fonte_num = _carregar_fonte_pil_destaque(int(largura / 11))
+
+    bb_n = draw.textbbox((0, 0), texto_num, font=fonte_num) if texto_num else (0, 0, 0, 0)
+    bb_t = draw.textbbox((0, 0), nome, font=fonte_nome)
+    w_n, h_n = bb_n[2] - bb_n[0], bb_n[3] - bb_n[1]
+    w_t, h_t = bb_t[2] - bb_t[0], bb_t[3] - bb_t[1]
+    espaco = int(altura * 0.025)
+    pad = int(largura * 0.025)
+
+    w_painel = max(w_n, w_t) + 2 * pad
+    h_painel = h_n + (espaco if texto_num else 0) + h_t + 2 * pad
+    x0 = (largura - w_painel) // 2
+    y0 = int(altura * 0.16)
+    draw.rounded_rectangle([x0, y0, x0 + w_painel, y0 + h_painel], radius=int(pad * 0.8),
+                           fill=(0, 0, 0, 175))
+    y = y0 + pad
+    if texto_num:
+        draw.text(((largura - w_n) / 2 - bb_n[0], y - bb_n[1]), texto_num, font=fonte_num,
+                  fill=(255, 255, 255, 255))
+        y += h_n + espaco
+    draw.text(((largura - w_t) / 2 - bb_t[0], y - bb_t[1]), nome, font=fonte_nome,
+              fill=(255, 255, 255, 255))
+
+    caminho_temp = os.path.join(ASSETS_DIR, f'_card_item_{abs(hash((numero, nome))) % 100000}.png')
+    img.save(caminho_temp)
+    fade = min(0.5, duracao / 4)
+    return ImageClip(caminho_temp).set_duration(duracao).crossfadein(fade).crossfadeout(fade)
 
 
 def pesquisar_foto_pexels(termo):
@@ -2781,6 +2918,17 @@ def main():
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
 
+    # 1ª pergunta da interação: estrutura do vídeo (webdoc em capítulos ou lista numerada).
+    # Sem Telegram/timeout vale 'formato_video_telegram.formato_padrao' (padrão: webdoc —
+    # o comportamento de sempre).
+    formato_video = {'formato': 'webdoc'}
+    if config.get('modo_roteiro') == 'capitulos_webdoc':
+        try:
+            formato_video = escolher_formato_telegram()
+        except Exception as e:
+            print(f"  ⚠️ Falha na escolha de formato via Telegram ({e}) — usando webdoc")
+    eh_lista = formato_video.get('formato') == 'lista'
+
     tema = None
     if ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
         try:
@@ -2800,8 +2948,11 @@ def main():
         tipo_video=VIDEO_TYPE,
         gemini_generate_fn=_gemini_generate,
         modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
-        num_capitulos=config.get('num_capitulos_webdoc', 3),
+        num_capitulos=formato_video['num_itens'] if eh_lista else config.get('num_capitulos_webdoc', 3),
         palavras_alvo_webdoc=config.get('palavras_alvo_webdoc'),
+        formato='lista' if eh_lista else 'webdoc',
+        itens_lista=formato_video.get('itens'),
+        ordem_lista=formato_video.get('ordem', 'regressiva'),
     )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
