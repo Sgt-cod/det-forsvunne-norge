@@ -50,6 +50,7 @@ _CFG = {
     'nota_publico': '',       # nota sobre público/país injetada nos prompts de estrutura/escrita
     'chars_min': None,        # alvo de tamanho do roteiro INTEIRO, em caracteres (com espaços)
     'chars_max': None,
+    'abertura_intro': '',     # apresentação fixa do canal, inserida no começo da introdução
     'chars_por_palavra': 6.2, # média (com espaço) usada só pra converter alvo de chars em palavras
 }
 
@@ -67,6 +68,27 @@ def _regra_numeros():
 
 def _nota_publico():
     return f"\n{_CFG['nota_publico']}\n" if _CFG['nota_publico'] else ""
+
+
+def _regra_abertura():
+    if not _CFG['abertura_intro']:
+        return ""
+    return (f"\nABERTURA FIXA DO CANAL: a introdução COMEÇA com esta apresentação, que o sistema "
+            f"insere automaticamente antes do seu texto: \"{_CFG['abertura_intro'].strip()}\". "
+            f"Portanto NÃO escreva saudação, nome do canal nem apresentação própria — comece direto "
+            f"pelo gancho do tema, numa frase que soe como continuação natural dessa apresentação.\n")
+
+
+def _aplicar_abertura_intro(blocos):
+    """Garante (de forma determinística, sem depender do Gemini obedecer) que a introdução
+    começa com a apresentação fixa do canal. Não duplica se o texto já começar com ela."""
+    abertura = (_CFG['abertura_intro'] or '').strip()
+    if not abertura or not blocos or blocos[0].get('bloco') != 'introducao':
+        return blocos
+    norm = lambda t: re.sub(r'\W+', ' ', t.lower()).strip()
+    if not norm(blocos[0]['texto']).startswith(norm(abertura)):
+        blocos[0]['texto'] = f"{abertura} {blocos[0]['texto'].lstrip()}"
+    return blocos
 
 
 def _pos_processar_texto(texto):
@@ -301,7 +323,7 @@ REGRAS OBRIGATÓRIAS:
   um termo — se precisar variar, troque por uma expressão equivalente por extenso
   ("o país", "a potência norte-americana", "o mercado americano"), nunca por uma sigla
   ou código{_regra_numeros()}{linha_extra}
-{_nota_publico()}
+{_nota_publico()}{_regra_abertura()}
 Retorne APENAS JSON:
 {{
   "blocos": [
@@ -866,6 +888,7 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
             b['texto'] = _pos_processar_texto(b['texto'])
             if _CFG['idioma_numeros'] and contem_digitos(b['texto']):
                 print(f"  ⚠️ Bloco '{b['bloco']}' ainda tem dígito após a normalização — revise.")
+        blocos = _aplicar_abertura_intro(blocos)
 
         tema_meta = tema
         if formato == 'lista':
