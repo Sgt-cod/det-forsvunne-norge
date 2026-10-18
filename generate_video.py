@@ -137,7 +137,7 @@ DURACAO_MINIMA_CLIPE = float(os.environ.get('DURACAO_MINIMA_CLIPE', '7'))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
-ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', 'true').lower() == 'true'  # Fase 2: texto de destaque
+ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
 ATIVAR_SFX = os.environ.get('ATIVAR_SFX', 'true').lower() == 'true'  # Fase 2: SFX de transição/destaque
 MAX_PAGINAS_BLOCO = int(os.environ.get('MAX_PAGINAS_BLOCO', '3'))  # páginas Pexels por bloco (não por vídeo)
 # LEGENDA_FONTE é definida logo após o carregamento do config.json (precisa do config.get(...))
@@ -229,10 +229,16 @@ roteiro_engine.configurar(
     chars_min=config.get('caracteres_alvo_min'),
     chars_max=config.get('caracteres_alvo_max'),
     chars_por_palavra=config.get('caracteres_por_palavra'),
+    abertura_intro=(config.get('abertura_introducao', {}).get('texto', '')
+                    if config.get('abertura_introducao', {}).get('ativo', False) else ''),
 )
 configurar_pais(**{k: v for k, v in config.get('contexto_pais', {}).items()})
 
 IDIOMA_REVISAO_PTBR = bool(config.get('telegram_traducao_ptbr', {}).get('ativo', False))
+# Canal em português: não há o que traduzir, mas a SUGESTÃO de mídia (+ botão do Pexels) continua
+# útil. 'telegram_sugestao_midia': {"ativo": true} liga o tradutor nesse modo "só sugestão".
+IDIOMA_CONTEUDO_EH_PT = 'portugu' in IDIOMA_CONTEUDO.lower()
+SUGESTAO_MIDIA_TELEGRAM = bool(config.get('telegram_sugestao_midia', {}).get('ativo', False))
 
 
 _MARCADORES_PT = {'não', 'que', 'uma', 'para', 'com', 'foi', 'são', 'mas', 'também', 'seu', 'sua',
@@ -306,13 +312,16 @@ def _traduzir_para_ptbr(textos, com_sugestao=False):
     Traduções que voltam iguais ao original (ou ainda em norueguês) são refeitas item a
     item; se ainda falhar, o item fica SEM tradução (None) em vez de repetir o norueguês.
     """
-    verificar = 'portugu' not in IDIOMA_CONTEUDO.lower()
-    try:
-        pts = _traduzir_lote(textos)
-    except Exception as e:
-        print(f"  ⚠️ Tradução em lote falhou ({e}) — tentando item a item")
-        pts = []
-    pts = (pts + [''] * len(textos))[:len(textos)]
+    verificar = not IDIOMA_CONTEUDO_EH_PT
+    if IDIOMA_CONTEUDO_EH_PT:
+        pts = [''] * len(textos)   # canal em português: nada a traduzir, só sugestão de mídia
+    else:
+        try:
+            pts = _traduzir_lote(textos)
+        except Exception as e:
+            print(f"  ⚠️ Tradução em lote falhou ({e}) — tentando item a item")
+            pts = []
+        pts = (pts + [''] * len(textos))[:len(textos)]
 
     for i, (orig, trad) in enumerate(zip(textos, pts)):
         if verificar and not _parece_portugues(orig, trad):
@@ -346,7 +355,7 @@ def _extrair_json_resposta(texto):
     return texto[texto.find('{'):texto.rfind('}') + 1]
 
 
-if IDIOMA_REVISAO_PTBR:
+if IDIOMA_REVISAO_PTBR or SUGESTAO_MIDIA_TELEGRAM:
     configurar_tradutor(_traduzir_para_ptbr)
 
 # Volume da música de fundo em relação à narração (0.06 = 6% do volume da narração,
@@ -2002,7 +2011,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     # duas vezes); a pergunta de áudio precisa vir antes da chamada à Fish Audio
     # pra não gastar TTS à toa quando você já sabe que vai mandar o seu.
     destaques_manuais_pre = None
-    if ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
+    if ATIVAR_DESTAQUE and ATIVA_TELEGRAM and config.get('destaques_telegram', {}).get('ativo', False):
         try:
             destaques_manuais_pre = escolher_destaques_telegram(texto_segmento, nome_segmento)
         except Exception as e:
@@ -2075,7 +2084,9 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
 
         destaques_manuais = destaques_manuais_pre
 
-        if destaques_manuais is not None:
+        if not ATIVAR_DESTAQUE:
+            destaques_por_bloco = [[] for _ in blocos_com_tempo_local]   # destaques desligados no config
+        elif destaques_manuais is not None:
             destaques_por_bloco = mapear_destaques_manuais_para_blocos(blocos_com_tempo_local, destaques_manuais)
         else:
             destaques_por_bloco = escolher_palavras_destaque(blocos_com_tempo_local, _gemini_generate,
@@ -2175,7 +2186,65 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         video_base = video_base.fadeout(dur_fade_out)
         audio_final = audio_final.audio_fadeout(dur_fade_out)
 
-    return video_base.set_audio(audio_final)
+    clip_final = video_base.set_audio(audio_final)
+
+    # Posição (em s, relativa ao INÍCIO DESTE SEGMENTO renderizado) de cada bloco — usada pra
+    # montar os capítulos da descrição (ex: onde começa o desfecho dentro do último segmento).
+    # Os tempos dos blocos são relativos à narração, que só começa depois do padding_inicio.
+    marcas = {}
+    if blocos_com_tempo_local:
+        for b in blocos_com_tempo_local:
+            marcas[b['bloco']] = padding_inicio + float(b['inicio'])
+    else:  # sem transcrição: estima pela proporção de caracteres de cada bloco
+        total_chars = max(1, sum(len(b['texto']) for b in grupo_blocos))
+        acumulado = 0
+        for b in grupo_blocos:
+            marcas[b['bloco']] = padding_inicio + duracao_narracao * acumulado / total_chars
+            acumulado += len(b['texto'])
+    clip_final.marcas_blocos = marcas
+    return clip_final
+
+
+CAPITULOS_VIDEO = []   # preenchido por montar_video_webdoc_por_capitulos: [(segundos, rótulo), ...]
+
+
+def _filtrar_capitulos_youtube(marcos, duracao_total):
+    """
+    Regras do YouTube pros capítulos da descrição: a lista precisa começar em 00:00, ter pelo
+    menos 3 capítulos e cada um com no mínimo 10 s — se uma dessas regras falhar, o YouTube
+    IGNORA a lista inteira. Capítulo curto demais é fundido no anterior (descartado); menos
+    de 3 capítulos → lista vazia (melhor sem capítulos do que com lista inválida).
+    """
+    marcos = sorted(marcos, key=lambda m: m[0])
+    if not marcos:
+        return []
+    marcos[0] = (0.0, marcos[0][1])
+    limpos = [marcos[0]]
+    for t, rotulo in marcos[1:]:
+        if t - limpos[-1][0] >= 10:
+            limpos.append((t, rotulo))
+    # o último capítulo também precisa durar >= 10 s até o fim do vídeo
+    while len(limpos) > 1 and duracao_total - limpos[-1][0] < 10:
+        limpos.pop()
+    if len(limpos) < 3:
+        print("  ⚠️ Menos de 3 capítulos válidos — descrição ficará SEM lista de capítulos")
+        return []
+    return limpos
+
+
+def formatar_capitulos_descricao(capitulos):
+    """[(segundos, rótulo)] → linhas 'mm:ss Rótulo' (ou 'h:mm:ss' se algum passa de 1 hora)."""
+    if not capitulos:
+        return ""
+    usa_hora = capitulos[-1][0] >= 3600
+    linhas = []
+    for t, rotulo in capitulos:
+        t = int(round(t))
+        h, resto = divmod(t, 3600)
+        m, sec = divmod(resto, 60)
+        marca = f"{h}:{m:02d}:{sec:02d}" if usa_hora else f"{m:02d}:{sec:02d}"
+        linhas.append(f"{marca} {rotulo}")
+    return "\n".join(linhas)
 
 
 def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura, altura, orientacao):
@@ -2246,24 +2315,57 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
 
     duracao_card = float(config.get('duracao_card_capitulo', 7.0))
 
+    global CAPITULOS_VIDEO
+    cap_cfg = config.get('capitulos_na_descricao', {})
+    rotulo_intro = cap_cfg.get('rotulo_introducao', 'Introdução')
+    rotulo_desfecho = cap_cfg.get('rotulo_desfecho', 'Conclusão')
+    marcos = []        # (segundos no vídeo FINAL, rótulo) — vira a lista de capítulos da descrição
+    cursor = 0.0       # concatenate_videoclips(method='compose') coloca cada peça logo após a anterior,
+                       # então o início de uma peça = soma das durações das peças antes dela
+    marco_atual = 0.0  # onde o próximo segmento "começa" pro espectador (no webdoc: no card dele)
+
     clips_finais = []
     for i, grupo in enumerate(segmentos):
         fade_in = (i > 0)  # a introdução (i=0) é o próprio início do vídeo — sem fade-in
         clip_segmento = renderizar_segmento_webdoc(grupo, tema, largura, altura, orientacao,
                                                     i, fade_in=fade_in, fade_out=True)
+        inicio_real = cursor
         clips_finais.append(clip_segmento)
+        cursor += clip_segmento.duration
+
+        marcas_blocos = getattr(clip_segmento, 'marcas_blocos', {})
+        for k, b in enumerate(grupo):
+            if b['bloco'] == 'introducao':
+                rotulo = rotulo_intro
+            elif b.get('titulo_capitulo'):
+                rotulo = (f"{b['numero_item']}. {b['titulo_capitulo']}"
+                          if b.get('numero_item') is not None else b['titulo_capitulo'])
+            elif b['bloco'] == 'desfecho':
+                rotulo = rotulo_desfecho
+            else:
+                continue
+            if k == 0:
+                marcos.append((marco_atual, rotulo))
+            elif b['bloco'] in marcas_blocos:
+                marcos.append((inicio_real + marcas_blocos[b['bloco']], rotulo))
 
         if i < len(segmentos) - 1:
             if i == 0 and vinheta_clip:
                 clips_finais.append(vinheta_clip)
+                cursor += vinheta_clip.duration   # a abertura entra na conta (fica na introdução)
+            marco_atual = cursor
             if segmentos[i + 1][0].get('formato_card') == 'overlay':
                 continue  # lista: o card entra como overlay dentro do próprio item
             titulo_proximo = segmentos[i + 1][0].get('titulo_capitulo', '')
             card = gerar_card_capitulo(titulo_proximo, largura, altura, duracao=duracao_card)
             clips_finais.append(card)
+            cursor += card.duration
 
     if cta_clip:
         clips_finais.append(cta_clip)  # direto após o desfecho, sem card de título antes
+        cursor += cta_clip.duration
+
+    CAPITULOS_VIDEO = _filtrar_capitulos_youtube(marcos, cursor)
 
     print(f"  🔗 Concatenando {len(clips_finais)} peça(s) (segmentos + vinheta + cards + CTA)...")
     video_final = concatenate_videoclips(clips_finais, method='compose')
@@ -3143,8 +3245,22 @@ def main():
         f"{descricao_pacote.get('abertura_seo', '')}\n\n{descricao_pacote.get('corpo', '')}"
         if descricao_pacote.get('corpo') else roteiro[:300] + '...'
     )
-    descricao = corpo_descricao + f'\n\n{texto_inscricao}\n#' + \
-                ('shorts' if VIDEO_TYPE == 'short' else hashtag_conteudo)
+    # Hashtags: config 'hashtags_descricao' (lista). Sem ela, usa o 'hashtag_conteudo' único de
+    # sempre. O YouTube mostra as 3 primeiras acima do título e ignora TODAS se passar de 15.
+    hashtags_cfg = config.get('hashtags_descricao') or [hashtag_conteudo]
+    if VIDEO_TYPE == 'short':
+        hashtags_cfg = ['shorts'] + list(hashtags_cfg)
+    hashtags, vistos = [], set()
+    for h in hashtags_cfg:
+        h = re.sub(r'[^\w]', '', str(h).lstrip('#'), flags=re.UNICODE)  # sem espaço/pontuação
+        if h and h.lower() not in vistos:
+            vistos.add(h.lower())
+            hashtags.append('#' + h)
+    bloco_capitulos = ""
+    if config.get('capitulos_na_descricao', {}).get('ativo', False) and CAPITULOS_VIDEO:
+        bloco_capitulos = "\n\n" + formatar_capitulos_descricao(CAPITULOS_VIDEO)
+        print("  📑 Capítulos na descrição:\n     " + bloco_capitulos.strip().replace("\n", "\n     "))
+    descricao = corpo_descricao + bloco_capitulos + f'\n\n{texto_inscricao}\n' + ' '.join(hashtags[:15])
     tags = config.get('tags_padrao', ['reflexao crista', 'motivacional', 'fe', 'inspiracao'])
     if VIDEO_TYPE == 'short':
         tags.append('shorts')
@@ -3165,7 +3281,7 @@ def main():
         print(f"   Texto da thumb: {texto_thumb}")
         thumbnail_path = gerar_thumbnail(texto_thumb, termo, f'{ASSETS_DIR}/thumbnail.jpg')
         legenda_thumb = ""
-        if IDIOMA_REVISAO_PTBR:
+        if IDIOMA_REVISAO_PTBR and not IDIOMA_CONTEUDO_EH_PT:
             try:
                 tr = _traduzir_para_ptbr([titulo_video, texto_thumb])
                 legenda_thumb = (f"Título: {titulo_video}\n🇧🇷 {tr[0]['pt']}\n\n"
