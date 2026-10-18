@@ -129,5 +129,10 @@
     "timeout_resposta_min": 10,
     "formato_padrao": "webdoc"
   },
-  "duracao_card_item": 4.5
+  "duracao_card_item": 4.5,
+  "capitulos_na_descricao": {
+    "ativo": true,
+    "rotulo_introducao": "Innledning",
+    "rotulo_desfecho": "Avslutning"
+  }
 }
