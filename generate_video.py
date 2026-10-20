@@ -137,7 +137,7 @@ DURACAO_MINIMA_CLIPE = float(os.environ.get('DURACAO_MINIMA_CLIPE', '7'))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
-ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
+
 ATIVAR_SFX = os.environ.get('ATIVAR_SFX', 'true').lower() == 'true'  # Fase 2: SFX de transição/destaque
 MAX_PAGINAS_BLOCO = int(os.environ.get('MAX_PAGINAS_BLOCO', '3'))  # páginas Pexels por bloco (não por vídeo)
 # LEGENDA_FONTE é definida logo após o carregamento do config.json (precisa do config.get(...))
@@ -165,6 +165,8 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
+
+ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
 
 # config.json pode sobrescrever o padrão de 2.5s/3s definido acima (env var continua
 # tendo prioridade se for setada explicitamente — só cai pro config.json se a env var
