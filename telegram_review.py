@@ -149,8 +149,18 @@ def _teclado(botoes):
     return json.dumps({'inline_keyboard': [[_b(t, d) for t, d in linha] for linha in linhas]})
 
 
+LIMITE_MENSAGEM_TELEGRAM = 4096   # limite REAL do sendMessage (em caracteres, depois do parse)
+
+
 def enviar_texto(texto, botoes=None):
-    """botoes: ver _teclado()."""
+    """botoes: ver _teclado(). Texto acima do limite do Telegram é dividido em várias
+    mensagens (botões só na última) em vez de falhar com '400 Bad Request'."""
+    if len(texto) > LIMITE_MENSAGEM_TELEGRAM - 100:
+        pedacos = _quebrar_texto(texto, limite=3800)
+        resposta = None
+        for i, pedaco in enumerate(pedacos):
+            resposta = enviar_texto(pedaco, botoes=botoes if i == len(pedacos) - 1 else None)
+        return resposta
     params = {'chat_id': TELEGRAM_CHAT_ID, 'text': texto}
     if botoes:
         params['reply_markup'] = _teclado(botoes)
@@ -1084,6 +1094,39 @@ def escolher_formato_telegram(timeout_min=None):
     return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens, 'notas': notas}
 
 
+def perguntar_base_fechada_telegram(texto, timeout_min=None):
+    """
+    Chamada quando o 'tema' enviado é longo (um briefing com instruções + dados). Pergunta se
+    o texto deve valer como BASE FECHADA — o roteiro usa SÓ os fatos que estão nele, e uma
+    etapa extra confere o roteiro contra a base — ou apenas como tema/direcionamento (o
+    Gemini pode complementar com conhecimento próprio, como sempre).
+    Devolve True (base fechada) ou False. Sem resposta no tempo: usa 'base_fechada_telegram'
+    → 'padrao' do config ('base' por padrão: é o lado seguro contra dado inventado).
+    """
+    cfg = _config().get('base_fechada_telegram', {})
+    padrao_base = cfg.get('padrao', 'base') == 'base'
+    if not ATIVA_TELEGRAM:
+        return padrao_base
+    if timeout_min is None:
+        timeout_min = _timeout_min('base_fechada_telegram', 10)
+    limpar_filas_pendentes()
+    enviar_texto(
+        f"🔒 Recebi {len(texto)} caracteres. Usar como BASE FECHADA?\n\n"
+        "• 🔒 Base fechada: o roteiro usa SÓ os dados que você mandou, e uma etapa extra confere "
+        "o texto contra eles (frases sem sustento são removidas ou suavizadas).\n"
+        "• 📝 Só como tema: o Gemini usa o texto como direção e pode complementar com o que ele sabe "
+        "(risco de dado errado).",
+        botoes=[('🔒 Base fechada', 'base'), ('📝 Só como tema', 'tema')])
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+        if tipo is None:
+            enviar_texto("⏱️ Sem resposta — usando " + ("BASE FECHADA." if padrao_base else "só como tema."))
+            return padrao_base
+        if tipo == 'callback' and valor in ('base', 'tema'):
+            enviar_texto("🔒 Base fechada ativada." if valor == 'base' else "📝 Usando só como tema.")
+            return valor == 'base'
+
+
 def escolher_tema_telegram(timeout_min=None):
     """
     Pergunta o tema/direcionamento do próximo vídeo, com botão "Nada a sugerir". Texto
@@ -1119,8 +1162,15 @@ def escolher_tema_telegram(timeout_min=None):
             msg = upd.get('message')
             if msg and str(msg.get('chat', {}).get('id')) == str(TELEGRAM_CHAT_ID) and msg.get('text'):
                 tema = msg['text'].strip()
-                enviar_texto(f"👍 Tema recebido: \"{tema}\". Gerando o roteiro...")
-                print(f"  🎯 Tema recebido via Telegram: \"{tema}\"")
+                # A confirmação NUNCA pode derrubar a escolha: antes, um tema perto do limite
+                # (4093 caracteres) + o texto da confirmação passava de 4096 → 400 → o tema
+                # do usuário era descartado e o Gemini escolhia outro.
+                resumo = tema if len(tema) <= 300 else tema[:300].rstrip() + "…"
+                try:
+                    enviar_texto(f"👍 Tema recebido ({len(tema)} caracteres): \"{resumo}\". Gerando o roteiro...")
+                except Exception as e:
+                    print(f"  ⚠️ Confirmação do tema não enviada ({e}) — seguindo com o tema recebido")
+                print(f"  🎯 Tema recebido via Telegram: \"{resumo}\"")
                 return tema
 
     print(f"  ⏱️ Sem resposta de tema em {timeout_min} min — escolhendo automaticamente")
