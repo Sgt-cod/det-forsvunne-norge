@@ -51,6 +51,7 @@ from mockups_visuais import gerar_print_noticia
 from rede_utils import com_watchdog
 from telegram_review import (
     ATIVA_TELEGRAM, revisar_midia_pipeline, escolher_tema_telegram, escolher_formato_telegram,
+    perguntar_base_fechada_telegram,
     escolher_destaques_telegram, revisar_thumbnail_telegram, WorkflowCanceladoPeloUsuario,
     perguntar_audio_customizado_telegram, configurar_tradutor,
     escolher_publicacao_telegram, enviar_texto as telegram_enviar_texto,
@@ -137,7 +138,7 @@ DURACAO_MINIMA_CLIPE = float(os.environ.get('DURACAO_MINIMA_CLIPE', '7'))
 
 # ── Legenda automática ───────────────────────────────────────────────────────
 ATIVAR_LEGENDA = os.environ.get('ATIVAR_LEGENDA', 'true').lower() == 'true'
-
+# ATIVAR_DESTAQUE é definida logo após o carregamento do config.json (precisa do config.get(...))
 ATIVAR_SFX = os.environ.get('ATIVAR_SFX', 'true').lower() == 'true'  # Fase 2: SFX de transição/destaque
 MAX_PAGINAS_BLOCO = int(os.environ.get('MAX_PAGINAS_BLOCO', '3'))  # páginas Pexels por bloco (não por vídeo)
 # LEGENDA_FONTE é definida logo após o carregamento do config.json (precisa do config.get(...))
@@ -165,8 +166,6 @@ def _gemini_generate(prompt, tentativas=3, espera=15):
 
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
-
-ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
 
 # config.json pode sobrescrever o padrão de 2.5s/3s definido acima (env var continua
 # tendo prioridade se for setada explicitamente — só cai pro config.json se a env var
@@ -198,6 +197,8 @@ INSTRUCAO_EXTRA_ROTEIRO = config.get('instrucao_extra_roteiro', '')
 # no runner — veja o step do .yml que instala as fontes de fonts/ no sistema).
 # Liberation Sans Bold é o padrão livre, geralmente já vem instalado no runner sem esforço extra.
 LEGENDA_FONTE = os.environ.get('LEGENDA_FONTE', config.get('fonte_legenda_nome', 'Liberation-Sans-Bold'))
+# 'ativar_destaque': false no config desliga os termos em destaque (env ATIVAR_DESTAQUE tem prioridade)
+ATIVAR_DESTAQUE = os.environ.get('ATIVAR_DESTAQUE', str(config.get('ativar_destaque', True))).lower() == 'true'  # Fase 2: texto de destaque
 COR_DESTAQUE = os.environ.get('COR_DESTAQUE', config.get('cor_destaque', '#FFD24D'))  # Fase 2: texto de destaque
 FONTE_DESTAQUE = os.environ.get('FONTE_DESTAQUE', config.get('fonte_destaque_arquivo', config.get('fonte_destaque_nome', LEGENDA_FONTE)))
 DURACAO_POP_DESTAQUE = float(os.environ.get('DURACAO_POP_DESTAQUE', '0.18'))  # tempo do "estalo" de entrada
@@ -350,6 +351,22 @@ def _traduzir_para_ptbr(textos, com_sugestao=False):
              'sugestao': (sugestoes[i].get('sugestao') or '').strip() or None,
              'busca_en': (sugestoes[i].get('busca_en') or '').strip() or None}
             for i in range(len(textos))]
+
+
+def _extrair_tema_do_briefing(briefing):
+    """Uma frase curta com o ASSUNTO do vídeo, tirada do briefing (instruções + dados)."""
+    try:
+        r = _gemini_generate(
+            "Leia o briefing abaixo e responda APENAS com o assunto do vídeo em UMA frase curta "
+            f"(até 150 caracteres), em {IDIOMA_CONTEUDO}, sem aspas e sem explicação.\n\nBRIEFING:\n"
+            + briefing[:6000])
+        tema = r.text.strip().strip('"').splitlines()[0].strip()
+        if tema:
+            return tema[:150]
+    except Exception as e:
+        print(f"  ⚠️ Não consegui extrair o tema do briefing ({e}) — usando a primeira linha")
+    primeira = next((l.strip() for l in briefing.splitlines() if l.strip()), briefing[:150])
+    return primeira[:150]
 
 
 def _extrair_json_resposta(texto):
@@ -3041,6 +3058,22 @@ def main():
             print(f"  ⚠️ Falha na seleção de tema via Telegram ({e}) — escolhendo automaticamente")
     if not tema:
         tema = escolher_tema_reflexao()
+
+    # Tema longo vindo do Telegram = briefing (instruções + dados). Se você confirmar "base
+    # fechada", o roteiro só pode usar os fatos desse texto (e uma etapa extra os confere);
+    # 'tema' vira uma frase curta (o briefing inteiro não serve de título/busca/log).
+    cfg_base = config.get('base_fechada_telegram', {})
+    if ATIVA_TELEGRAM and cfg_base.get('ativo', False) and len(tema) >= int(cfg_base.get('limiar_caracteres', 400)):
+        try:
+            usar_base = perguntar_base_fechada_telegram(tema)
+        except Exception as e:
+            print(f"  ⚠️ Falha na pergunta de base fechada ({e}) — tratando como base fechada (lado seguro)")
+            usar_base = True
+        if usar_base:
+            briefing = tema
+            roteiro_engine.definir_base_dados(briefing)
+            tema = _extrair_tema_do_briefing(briefing)
+            print(f"  🔒 BASE FECHADA ativa ({len(briefing)} caracteres). Tema: {tema}")
 
     print("✍️ Gerando roteiro (cadeia: tese → estrutura → escrita → crítica → título/descrição)...")
     pacote_roteiro = gerar_pacote_roteiro(
