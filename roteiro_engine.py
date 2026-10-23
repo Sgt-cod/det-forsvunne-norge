@@ -50,6 +50,7 @@ _CFG = {
     'nota_publico': '',       # nota sobre público/país injetada nos prompts de estrutura/escrita
     'chars_min': None,        # alvo de tamanho do roteiro INTEIRO, em caracteres (com espaços)
     'chars_max': None,
+    'base_dados': '',         # BASE FECHADA fornecida pelo criador pro vídeo atual (ver definir_base_dados)
     'abertura_intro': '',     # apresentação fixa do canal, inserida no começo da introdução
     'chars_por_palavra': 6.2, # média (com espaço) usada só pra converter alvo de chars em palavras
 }
@@ -68,6 +69,38 @@ def _regra_numeros():
 
 def _nota_publico():
     return f"\n{_CFG['nota_publico']}\n" if _CFG['nota_publico'] else ""
+
+
+def definir_base_dados(texto):
+    """Liga o modo BASE FECHADA pro vídeo atual: o texto do criador (instruções + dados) passa
+    a ser a ÚNICA fonte de fatos em todas as etapas. Chame com '' pra desligar."""
+    _CFG['base_dados'] = (texto or '').strip()
+
+
+def _bloco_base():
+    """Regra + base, injetada em TODO prompt que escreve/reescreve texto ou título.
+    Vazio quando não há base fechada (comportamento de sempre)."""
+    base = _CFG['base_dados']
+    if not base:
+        return ""
+    return f"""
+BASE DE DADOS FECHADA (fornecida pelo criador do canal — contém instruções e dados):
+<<<BASE
+{base}
+BASE>>>
+REGRAS DA BASE FECHADA — inegociáveis:
+- Use SOMENTE fatos, números, datas, nomes, valores e citações que estejam NA BASE acima.
+  NÃO acrescente nada do seu conhecimento próprio (nem "de memória", nem "aproximadamente",
+  nem exemplos reais que não estejam na base) e NÃO complete lacunas com suposição apresentada
+  como fato.
+- Se um ponto necessário não estiver na base, trate-o de forma geral e qualitativa, ou omita.
+  Nunca invente número, percentual, data, nome ou fonte.
+- ANÁLISE e interpretação são permitidas, desde que se apoiem nos dados da base e sejam
+  apresentadas como leitura possível ("isso sugere", "uma leitura possível é"), nunca como fato novo.
+- Números da base escritos em algarismos podem (e devem, se a regra de números pedir) aparecer
+  por extenso no texto, com o MESMO valor.
+- Siga as instruções do criador contidas na base (tom, ângulo, foco, o que evitar).
+"""
 
 
 def _regra_abertura():
@@ -323,7 +356,7 @@ REGRAS OBRIGATÓRIAS:
   um termo — se precisar variar, troque por uma expressão equivalente por extenso
   ("o país", "a potência norte-americana", "o mercado americano"), nunca por uma sigla
   ou código{_regra_numeros()}{linha_extra}
-{_nota_publico()}{_regra_abertura()}
+{_nota_publico()}{_regra_abertura()}{_bloco_base()}
 Retorne APENAS JSON:
 {{
   "blocos": [
@@ -402,7 +435,7 @@ Escreva em {idioma_conteudo}.
 
 REGRAS: nunca use siglas/abreviações pra país/órgão/instituição (escreva por extenso,
 ex: "Estados Unidos", nunca "EUA" ou qualquer código curto) — o texto vai pra um TTS
-que lê tudo literalmente.{_regra_numeros()}
+que lê tudo literalmente.{_regra_numeros()}{_bloco_base()}
 "texto_novo" deve ser só o texto puro que vai ser narrado,
 sem o prefixo "[n] (bloco):" usado acima, sem colchetes, sem marcação técnica de
 produção (timecode, trilha, SFX, rótulo de locutor).
@@ -503,7 +536,7 @@ final; ao desenvolver, acrescente fato/exemplo concreto, nunca frase genérica. 
 {trechos}
 
 REGRAS: texto 100% falável (sem marcação de produção, sem colchetes); nenhuma sigla; sem
-travessão solto.{_regra_numeros()}
+travessão solto.{_regra_numeros()}{_bloco_base()}
 "texto_novo" é só o texto puro do bloco, sem o prefixo "[n] (bloco):".
 
 Retorne APENAS JSON com TODOS os blocos: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
@@ -597,7 +630,7 @@ como "Elementar" no YouTube). NÃO escreva prosa ainda — apenas o esqueleto, e
 
 NICHO: {contexto_nicho}
 TEMA: "{tema}"
-{_nota_publico()}
+{_nota_publico()}{_bloco_base()}
 A diferença entre um webdoc investigativo de verdade e um resumo genérico é esta: o
 webdoc ANCORA a explicação abstrata em UM CASO CONCRETO — data, número, nome de lugar
 ou instituição — e usa esse caso como fio condutor que atravessa o vídeo inteiro, não
@@ -695,7 +728,7 @@ esqueleto, em {idioma_conteudo}.
 
 NICHO: {contexto_nicho}
 TEMA DA LISTA: "{tema}"
-{_nota_publico()}
+{_nota_publico()}{_bloco_base()}
 {bloco_itens}
 {sentido}
 
@@ -877,6 +910,12 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
         # de nenhum reforço aqui (diferente de quando o título entrava embutido no
         # próprio texto falado, que já não é mais o caso).
 
+        if _CFG['base_dados']:
+            print("  🔒 Base fechada ativa — verificando o roteiro contra a base...")
+            blocos = _com_retry_estagio(
+                "Verificação da base", verificar_fidelidade_base,
+                blocos, idioma_conteudo, gemini_generate_fn)
+
         if _CFG['chars_min'] and _CFG['chars_max']:
             blocos = _com_retry_estagio(
                 "Ajuste de tamanho", ajustar_tamanho_por_caracteres,
@@ -927,7 +966,7 @@ def gerar_pacote_roteiro_capitulos(tema, contexto_nicho, idioma_conteudo, instru
         print(f"  ⚠️ Cadeia de capítulos falhou ({e}) — usando geração simples de emergência")
         traceback.print_exc()
         prompt_simples = f"""Crie um roteiro de narração investigativo para um vídeo de {contexto_nicho}
-sobre "{tema}", em {idioma_conteudo}, ~{palavras_alvo} palavras, tom direto e factual.
+sobre "{tema}", em {idioma_conteudo}, ~{palavras_alvo} palavras, tom direto e factual.{_bloco_base()}
 Escreva APENAS o roteiro corrido."""
         resposta = gemini_generate_fn(prompt_simples)
         roteiro_texto = re.sub(r'\*+', '', resposta.text).replace('#', '').strip()
@@ -970,7 +1009,7 @@ Cada variante prioriza EXPLICITAMENTE um destes critérios (rotule qual):
 - emocao: nomeia o sentimento/estado que o vídeo aborda (indignação, choque, injustiça)
 
 TEMA: {tema}
-{_resumo_estrutura_para_prompt(estrutura)}
+{_resumo_estrutura_para_prompt(estrutura)}{_bloco_base()}
 
 O título tem que dar pra entender do que o vídeo trata SEM contexto adicional — nunca
 um número ou palavra solta sem gancho (ex: "QUATRO BILHÕES" sozinho não diz nada; "A
@@ -1002,7 +1041,7 @@ def gerar_descricao_final_simples(tema, estrutura, idioma_conteudo, gemini_gener
     prompt = f"""Escreva a descrição do vídeo em duas partes, em {idioma_conteudo}.
 
 TEMA: {tema}
-{_resumo_estrutura_para_prompt(estrutura)}
+{_resumo_estrutura_para_prompt(estrutura)}{_bloco_base()}
 
 1. abertura_seo (até 150 caracteres): termos de busca reais que alguém digitaria sobre
    esse tema — não invente termos.
@@ -1017,6 +1056,50 @@ Retorne APENAS JSON: {{"abertura_seo": "...", "corpo": "..."}}"""
 # ============================================================
 # ESTÁGIO 4 — CRÍTICA ADVERSARIAL + REESCRITA CIRÚRGICA
 # ============================================================
+
+def verificar_fidelidade_base(blocos, idioma_conteudo, gemini_generate_fn):
+    """
+    Estágio EXTRA, só com base fechada: um revisor separado compara o roteiro com a base e
+    reescreve APENAS as frases que afirmam algo que a base não sustenta (número, data, nome,
+    fato novo). Chamada separada de propósito — quem escreve o texto raramente enxerga o
+    próprio fato inventado. Não é à prova de falhas: a conferência humana continua necessária.
+    """
+    if not _CFG['base_dados']:
+        return blocos
+    roteiro = "\n".join(f"[{i}] ({b['bloco']}): {b['texto']}" for i, b in enumerate(blocos))
+    prompt = f"""Você é um checador de fatos rigoroso. Compare o ROTEIRO (em {idioma_conteudo}) com a BASE.
+{_bloco_base()}
+ROTEIRO:
+{roteiro}
+
+Para cada bloco, ache as frases que afirmam como fato algo que a BASE NÃO sustenta (número,
+percentual, data, nome, local, causa ou citação que não esteja na base, ou que contradiga
+a base). Números por extenso equivalem aos algarismos da base se o valor for o mesmo.
+Análise e opinião claramente marcadas como interpretação NÃO são problema.
+
+Para cada bloco com problema, devolva o texto COMPLETO corrigido: troque a frase problemática
+por uma versão qualitativa que a base sustente, ou remova-a. Não mexa no resto do bloco.
+{_regra_numeros()}
+
+Retorne APENAS JSON:
+{{"blocos": [{{"indice": 0, "problemas": ["frase ou trecho sem sustentação"], "texto_corrigido": "..."}}]}}
+(inclua só os blocos com problema; lista vazia se estiver tudo sustentado)"""
+    dados = _extrair_json(gemini_generate_fn(prompt).text)
+    corrigidos = 0
+    for item in dados.get('blocos', []):
+        i = item.get('indice')
+        novo = (item.get('texto_corrigido') or '').strip()
+        if not (isinstance(i, int) and 0 <= i < len(blocos) and novo and item.get('problemas')):
+            continue
+        novo = _pos_processar_texto(sanitizar_direcoes_de_producao(re.sub(r'\*+', '', novo)))
+        for trecho in item['problemas'][:6]:
+            print(f"  🔎 Bloco '{blocos[i]['bloco']}': trecho sem sustentação na base → {str(trecho)[:110]}")
+        blocos[i]['texto'] = novo
+        corrigidos += 1
+    print(f"  🔎 Verificação da base: {corrigidos} bloco(s) corrigido(s)" if corrigidos
+          else "  🔎 Verificação da base: nenhum trecho sem sustentação encontrado")
+    return blocos
+
 
 def criticar_e_reescrever(blocos, idioma_conteudo, gemini_generate_fn):
     """
@@ -1073,7 +1156,7 @@ IMPORTANTE — texto vai pra um TTS que lê tudo de forma LITERAL: se o texto or
 menciona um país/órgão/instituição por extenso (ex: "Estados Unidos"), o texto_novo
 tem que MANTER por extenso. Nunca troque isso por sigla, abreviação, ou por uma letra/
 código curto pra "variar" o texto ou evitar repetição — se precisar variar, use uma
-expressão equivalente por extenso ("o país", "a potência americana"), nunca uma sigla.{_regra_numeros()}
+expressão equivalente por extenso ("o país", "a potência americana"), nunca uma sigla.{_regra_numeros()}{_bloco_base()}
 
 Retorne APENAS JSON: {{"reescritas": [{{"indice": 0, "texto_novo": "..."}}]}}"""
 
