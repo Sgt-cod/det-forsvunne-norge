@@ -69,8 +69,8 @@
   "usar_prints_noticia": false,
   "usar_legenda": true,
   "volume_musica_fundo": 0.07,
-  "contexto_nicho": "documentário nostálgico sobre o passado: lugares, objetos, hábitos, programas, brinquedos e épocas que marcaram gerações (Noruega principalmente) e que desapareceram ou foram esquecidos",
-  "instrucao_extra_roteiro": "Tom nostálgico, caloroso e sensorial (cheiros, sons, texturas, rotinas), mas factual: datas e números precisam de verificação em fonte confiável antes da publicação. Evite melodrama e clichês de 'bons tempos' genéricos; ancore cada lembrança num detalhe concreto.",
+  "contexto_nicho": "webdoc investigativo sobre economia, mercado e sociedade na Noruega, partindo de rumores e especulações que já circulam publicamente (fóruns, mídia, redes) sobre empresas, produtos ou tecnologias que podem chegar ou sair do país, e analisando o que tornaria isso possível ou não: condições econômicas, mercado de trabalho, regulação, custos e impacto social",
+  "instrucao_extra_roteiro": "O ponto de partida é SEMPRE um rumor que já circula publicamente; nunca invente rumor nem o apresente como fato. Nos primeiros 30 a 40 segundos da introdução, diga com clareza que é rumor ou especulação não confirmada, e quem confirmou ou negou, se alguém. O vídeo NÃO tenta provar nem desmentir: explora as possibilidades — o que precisaria ser verdade pra acontecer, quem ganha e quem perde (empregos, preços, concorrência) e o que os dados dizem. Use dados só de fontes verificáveis (SSB, NAV, Norges Bank, Konkurransetilsynet, relatórios das empresas, imprensa) e cite a fonte em palavras, como 'segundo o SSB'. NUNCA invente número, percentual ou data; sem dado confiável, descreva qualitativamente. O gatilho emocional (receio, esperança, curiosidade) vem dos fatos e das consequências, sem alarmismo e sem afirmar intenção de empresa. Não generalize sobre grupos de pessoas; foque economia e instituições. Feche lembrando que segue sem confirmação e que sinais indicariam que é real.",
   "texto_inscricao": "🔔 Abonner for flere undersøkelser som denne!",
   "hashtag_conteudo": "dokumentar",
   "tags_padrao": [
@@ -134,5 +134,11 @@
     "ativo": true,
     "rotulo_introducao": "Innledning",
     "rotulo_desfecho": "Avslutning"
+  },
+  "base_fechada_telegram": {
+    "ativo": true,
+    "limiar_caracteres": 400,
+    "padrao": "base",
+    "timeout_resposta_min": 15
   }
 }
