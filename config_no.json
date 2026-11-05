@@ -1,6 +1,9 @@
 {
   "canal": "Det Forsvunne Forge",
   "modo_roteiro": "capitulos_webdoc",
+  "modelo_gemini": "gemini-3.5-flash-lite",
+  "modelo_gemini_fallback": "gemini-2.5-flash-lite",
+  "gemini_timeout_s": 180,
   "num_capitulos_webdoc": 3,
   "duracao_card_capitulo": 2.2,
   "idioma_conteudo": "norsk (bokmål)",
