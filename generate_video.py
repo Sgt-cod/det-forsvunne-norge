@@ -147,28 +147,56 @@ MAX_PAGINAS_BLOCO = int(os.environ.get('MAX_PAGINAS_BLOCO', '3'))  # páginas Pe
 # LEGENDA_FONTE é definida logo após o carregamento do config.json (precisa do config.get(...))
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel(GEMINI_TEXT_MODEL)
 
 
-def _gemini_generate(prompt, tentativas=3, espera=15):
+_MODELOS_GEMINI = {}
+
+
+def _modelo_gemini(nome):
+    if nome not in _MODELOS_GEMINI:
+        _MODELOS_GEMINI[nome] = genai.GenerativeModel(nome)
+    return _MODELOS_GEMINI[nome]
+
+
+def _gemini_generate(prompt, tentativas=5, espera=15):
     """
     Chama o Gemini com retry/backoff. Sem isso, qualquer instabilidade transitória da API
-    (ex: 504 DeadlineExceeded, 503 ServiceUnavailable, 429 rate limit) derruba o workflow
-    inteiro sem necessidade — geralmente uma segunda tentativa alguns segundos depois resolve.
+    (ex: 504 DeadlineExceeded, 503 "alta demanda", 429 rate limit) derruba o workflow
+    inteiro sem necessidade — geralmente uma nova tentativa alguns segundos depois resolve.
+
+    - Timeout por chamada: 'gemini_timeout_s' do config (padrão 180 s). O padrão da biblioteca
+      é 60 s, curto demais pra escrever um roteiro inteiro e a causa de vários "Timeout of
+      60.0s exceeded". O retry interno da biblioteca é desligado (retry=None): quem refaz é
+      este laço, que também troca de modelo.
+    - Modelo reserva: 'modelo_gemini_fallback' (config). Se o principal falhar 3 vezes seguidas
+      (ex: 503 por alta demanda naquele modelo), as tentativas seguintes usam o reserva.
     """
+    nomes = [GEMINI_MODELO_PRINCIPAL] + ([GEMINI_MODELO_FALLBACK] if GEMINI_MODELO_FALLBACK else [])
     ultimo_erro = None
     for tentativa in range(1, tentativas + 1):
+        nome = nomes[0] if (tentativa <= 3 or len(nomes) == 1) else nomes[1]
         try:
-            return model.generate_content(prompt)
+            modelo = _modelo_gemini(nome)
+            try:
+                return modelo.generate_content(
+                    prompt, request_options={'retry': None, 'timeout': GEMINI_TIMEOUT_S})
+            except TypeError:
+                return modelo.generate_content(prompt)   # versão antiga da biblioteca, sem request_options
         except Exception as e:
             ultimo_erro = e
-            print(f"  ⚠️ Erro no Gemini (tentativa {tentativa}/{tentativas}): {e}")
+            print(f"  ⚠️ Erro no Gemini [{nome}] (tentativa {tentativa}/{tentativas}): {e}")
             if tentativa < tentativas:
-                time.sleep(espera * tentativa)  # backoff progressivo: 15s, 30s, ...
+                time.sleep(espera * tentativa)  # backoff progressivo: 15s, 30s, 45s, ...
     raise ultimo_erro
 
 with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
     config = json.load(f)
+
+# Modelo do Gemini: env GEMINI_TEXT_MODEL > config 'modelo_gemini' > padrão. 'modelo_gemini_fallback'
+# (opcional) assume quando o principal falha 3 vezes seguidas; 'gemini_timeout_s' = tempo máx. por chamada.
+GEMINI_MODELO_PRINCIPAL = os.environ.get('GEMINI_TEXT_MODEL') or config.get('modelo_gemini') or GEMINI_TEXT_MODEL
+GEMINI_MODELO_FALLBACK = os.environ.get('GEMINI_TEXT_MODEL_FALLBACK') or config.get('modelo_gemini_fallback') or None
+GEMINI_TIMEOUT_S = float(config.get('gemini_timeout_s', 180))
 
 # config.json pode sobrescrever o padrão de 2.5s/3s definido acima (env var continua
 # tendo prioridade se for setada explicitamente — só cai pro config.json se a env var
