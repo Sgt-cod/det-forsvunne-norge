@@ -981,6 +981,123 @@ Escreva APENAS o roteiro corrido."""
         }
 
 
+# ============================================================
+# ROTEIRO PRÓPRIO (enviado pelo usuário no Telegram em vez de gerado pelo Gemini)
+# ============================================================
+
+_RE_INTRO = re.compile(r'^(?:introdu[cç][aã]o|introducao|intro|innledning|introduksjon)\s*[:.\-–—]?\s*$', re.IGNORECASE)
+_RE_CAP = re.compile(r'^(?:cap[ií]tulo|capitulo|kapittel|item|chapter)\s*(\d+)\s*[:.\-–—)]?\s*(.*)$', re.IGNORECASE)
+_RE_FIM = re.compile(r'^(?:desfecho|conclus[aã]o|conclusao|encerramento|avslutning|konklusjon|avslutt)\s*[:.\-–—]?\s*$', re.IGNORECASE)
+
+
+def parsear_roteiro_proprio(texto):
+    """
+    Divide o roteiro enviado pelo usuário nos mesmos blocos que o Gemini produziria
+    (introducao, capitulo_1..N, desfecho). Os títulos de seção ficam em linhas SOZINHAS:
+
+        INTRODUÇÃO            (ou INNLEDNING)
+        CAPÍTULO 1: Título    (ou KAPITTEL 1 / ITEM 1: Nome, em lista)
+        DESFECHO              (ou CONCLUSÃO / AVSLUTNING)
+
+    Aceita markdown (## e **) em volta do título. Levanta ValueError com uma mensagem
+    pronta pra mostrar ao usuário se faltar alguma seção ou alguma vier vazia.
+    """
+    secoes = []   # [tipo, titulo, [linhas]]
+    for linha in texto.replace('\r\n', '\n').split('\n'):
+        limpa = re.sub(r'^[#*\s]+|[*\s]+$', '', linha)
+        if _RE_INTRO.match(limpa):
+            secoes.append(['introducao', None, []])
+        elif _RE_FIM.match(limpa):
+            secoes.append(['desfecho', None, []])
+        elif _RE_CAP.match(limpa) and len(limpa) <= 120:
+            titulo = _RE_CAP.match(limpa).group(2).strip(' :.-–—*#')
+            secoes.append(['capitulo', titulo or None, []])
+        elif secoes:
+            secoes[-1][2].append(linha)
+
+    tipos = [t for t, _, _ in secoes]
+    if 'introducao' not in tipos:
+        raise ValueError("Não achei a INTRODUÇÃO. Coloque uma linha só com a palavra INTRODUÇÃO antes do primeiro trecho.")
+    if 'capitulo' not in tipos:
+        raise ValueError("Não achei nenhum CAPÍTULO. Use linhas como 'CAPÍTULO 1: Título' (ou 'ITEM 1: Nome' numa lista).")
+    if 'desfecho' not in tipos:
+        raise ValueError("Não achei o DESFECHO. Coloque uma linha só com a palavra DESFECHO antes do trecho final.")
+    if tipos[0] != 'introducao' or tipos[-1] != 'desfecho':
+        raise ValueError("A ordem precisa ser: INTRODUÇÃO, depois os CAPÍTULOS, e por último o DESFECHO.")
+
+    blocos, n_cap = [], 0
+    for tipo, titulo, linhas in secoes:
+        corpo = ' '.join(re.sub(r'\*+|^#+', '', ' '.join(linhas)).split())
+        if not corpo:
+            rotulo = (f"CAPÍTULO {n_cap + 1}" + (f" ({titulo})" if titulo else "")) if tipo == 'capitulo' else tipo.upper()
+            raise ValueError(f"A seção {rotulo} está vazia. Coloque o texto logo abaixo do título.")
+        if tipo == 'capitulo':
+            n_cap += 1
+            blocos.append({'bloco': f'capitulo_{n_cap}', 'texto': corpo, '_titulo': titulo or f'Capítulo {n_cap}'})
+        else:
+            blocos.append({'bloco': tipo, 'texto': corpo})
+    return blocos
+
+
+def montar_pacote_roteiro_proprio(texto, tema, contexto_nicho, idioma_conteudo, gemini_generate_fn,
+                                   formato='webdoc', ordem_lista='regressiva'):
+    """
+    Pacote de roteiro (mesmo formato de gerar_pacote_roteiro_capitulos) a partir de um roteiro
+    ESCRITO PELO USUÁRIO. O texto dele não é reescrito: só passa pela rede de segurança
+    determinística (números por extenso / pontuação solta, quando o canal pede) e pela
+    abertura fixa do canal (se ativa). O Gemini só gera título e descrição.
+    """
+    blocos = parsear_roteiro_proprio(texto)
+    titulos = {b['bloco']: b.pop('_titulo') for b in blocos if '_titulo' in b}
+    n_cap = len(titulos)
+
+    for b in blocos:
+        b['texto'] = _pos_processar_texto(b['texto'])
+        titulo_cap = titulos.get(b['bloco'])
+        b['titulo_capitulo'] = titulo_cap
+        b['inicio_capitulo'] = titulo_cap is not None
+        if formato == 'lista' and titulo_cap is not None:
+            idx = int(b['bloco'].split('_')[1]) - 1
+            b['formato_card'] = 'overlay'
+            b['numero_item'] = (n_cap - idx) if ordem_lista == 'regressiva' else (idx + 1)
+    blocos = _aplicar_abertura_intro(blocos)
+
+    if _CFG['idioma_numeros']:
+        for b in blocos:
+            if contem_digitos(b['texto']):
+                print(f"  ⚠️ Bloco '{b['bloco']}' ainda tem dígito após a normalização — revise.")
+
+    # estrutura mínima pros prompts de título/descrição (mesmas chaves da cadeia normal)
+    resumo = lambda t: t[:300]
+    estrutura = {
+        'caso_ancoragem': '',
+        'introducao': resumo(blocos[0]['texto']),
+        'capitulos': [{'titulo': titulos[b['bloco']], 'cobre': resumo(b['texto'])}
+                      for b in blocos if b['bloco'] in titulos],
+        'desfecho': resumo(blocos[-1]['texto']),
+    }
+    tema_meta = tema
+    if formato == 'lista':
+        tema_meta = (f"{tema} [FORMATO: vídeo de LISTA com {n_cap} itens — o título deve conter "
+                     f"o número {n_cap} e dizer o que a lista traz]")
+    titulo = _com_retry_estagio("Título (roteiro próprio)", gerar_titulo_final_simples,
+                                tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
+    descricao = _com_retry_estagio("Descrição (roteiro próprio)", gerar_descricao_final_simples,
+                                   tema_meta, estrutura, idioma_conteudo, gemini_generate_fn)
+
+    return {
+        'roteiro_texto': " ".join(b['texto'] for b in blocos),
+        'roteiro_blocos': blocos,
+        'titulo': titulo,
+        'descricao': descricao,
+        'tese': None,
+        'modo': 'capitulos_webdoc',
+        'formato': formato,
+        'capitulos_meta': [{'titulo': b['titulo_capitulo'], 'bloco': b['bloco']}
+                           for b in blocos if b.get('inicio_capitulo')],
+    }
+
+
 def _resumo_estrutura_para_prompt(estrutura):
     """
     Normaliza QUALQUER uma das estruturas de roteiro (devocional OU capítulos) num
