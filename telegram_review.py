@@ -124,7 +124,7 @@ def _requisitar_com_retry(verbo, url, tentativas=3, espera_s=3, **kwargs):
     raise ultimo_erro
 
 
-def _enviar_arquivo(metodo, campo_arquivo, caminho, **params):
+def _enviar_arquivo(metodo, campo_arquivo, caminho, _timeout=120, **params):
     # lê o arquivo pra memória ANTES de tentar — se _requisitar_com_retry precisar
     # tentar de novo (ex: depois de um 409), reabrir o arquivo a cada tentativa
     # evitaria o bug de mandar corpo vazio na 2ª tentativa (stream já consumido)
@@ -132,7 +132,7 @@ def _enviar_arquivo(metodo, campo_arquivo, caminho, **params):
         conteudo = f.read()
     nome_arquivo = os.path.basename(caminho)
     resp = _requisitar_com_retry('post', f"{_API_BASE}/{metodo}", data=params,
-                                  files={campo_arquivo: (nome_arquivo, conteudo)}, timeout=120)
+                                  files={campo_arquivo: (nome_arquivo, conteudo)}, timeout=_timeout)
     dados = resp.json()
     if not dados.get('ok'):
         raise RuntimeError(f"Telegram API '{metodo}' falhou: {dados}")
@@ -1092,6 +1092,168 @@ def escolher_formato_telegram(timeout_min=None):
                if itens else "itens escolhidos pelo pipeline."))
     enviar_texto(resumo)
     return {'formato': 'lista', 'num_itens': num_itens, 'ordem': ordem, 'itens': itens, 'notas': notas}
+
+
+# ============================================================
+# Roteiro próprio: você envia o roteiro em vez de o Gemini escrever
+# ============================================================
+
+def perguntar_origem_roteiro_telegram(timeout_min=None):
+    """Pergunta quem escreve o roteiro. Devolve 'gemini' ou 'eu'. Sem Telegram, sem config
+    ativa ou sem resposta no tempo → 'gemini' (o comportamento de sempre)."""
+    cfg = _config().get('roteiro_proprio_telegram', {})
+    if not ATIVA_TELEGRAM or not cfg.get('ativo', False):
+        return 'gemini'
+    if timeout_min is None:
+        timeout_min = _timeout_min('roteiro_proprio_telegram', 15)
+    limpar_filas_pendentes()
+    enviar_texto("📝 Quem escreve o roteiro deste vídeo?",
+                 botoes=[('🤖 Gemini escreve', 'gemini'), ('✍️ Eu envio o roteiro', 'eu')])
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+        if tipo is None:
+            enviar_texto("⏱️ Sem resposta — o Gemini escreve o roteiro.")
+            return 'gemini'
+        if tipo == 'callback' and valor in ('gemini', 'eu'):
+            return valor
+
+
+def receber_roteiro_telegram(validar=None, timeout_min=None):
+    """
+    Recebe o roteiro que você escreveu. Aceita VÁRIAS mensagens de texto (o Telegram limita
+    cada uma a 4096 caracteres) e/ou arquivos .txt/.md, e junta tudo na ordem; toque em
+    "✅ Terminei" quando acabar. 'validar(texto)' (opcional) deve levantar ValueError com uma
+    mensagem legível se o formato estiver errado — o erro é mostrado e você pode corrigir e
+    reenviar tudo. Devolve o texto completo, ou None se você desistir ("🤖 Deixa o Gemini")
+    ou não responder.
+    """
+    cfg = _config().get('roteiro_proprio_telegram', {})
+    if timeout_min is None:
+        timeout_min = int(cfg.get('timeout_resposta_min', 30))
+    botoes = [('✅ Terminei', 'fim'), ('🤖 Deixa o Gemini', 'gemini')]
+    enviar_texto(
+        "✍️ Mande o roteiro. Use títulos em linhas SOZINHAS:\n\n"
+        "INTRODUÇÃO\n(texto)\n\nCAPÍTULO 1: Título\n(texto)\n\nCAPÍTULO 2: Título\n(texto)\n\n"
+        "DESFECHO\n(texto)\n\n"
+        "• Numa lista, use ITEM 1: Nome, ITEM 2: Nome...\n"
+        "• Pode mandar em várias mensagens (limite de 4096 caracteres cada) ou em arquivo .txt.\n"
+        "• Toque em ✅ Terminei quando acabar.",
+        botoes=botoes)
+    partes = []
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+        if tipo is None:
+            if partes:
+                enviar_texto("⏱️ Sem resposta — usando o que você já enviou.")
+                valor = 'fim'
+                tipo = 'callback'
+            else:
+                enviar_texto("⏱️ Sem roteiro — o Gemini escreve.")
+                return None
+        if tipo == 'callback' and valor == 'gemini':
+            enviar_texto("🤖 Ok, o Gemini escreve o roteiro.")
+            return None
+        if tipo == 'callback' and valor == 'fim':
+            if not partes:
+                enviar_texto("⚠️ Ainda não recebi nada. Mande o texto do roteiro.")
+                continue
+            texto = "\n\n".join(partes)
+            if validar:
+                try:
+                    validar(texto)
+                except ValueError as e:
+                    enviar_texto(f"⚠️ {e}\n\nCorrija e mande o roteiro COMPLETO de novo (o que enviei antes foi descartado).",
+                                 botoes=botoes)
+                    partes = []
+                    continue
+            enviar_texto(f"✅ Roteiro recebido ({len(texto)} caracteres).")
+            return texto
+        if tipo == 'mensagem':
+            if valor['tipo'] == 'texto':
+                partes.append(valor['texto'])
+            elif valor['tipo'] == 'documento' and valor['caminho'] and \
+                    valor['caminho'].lower().endswith(('.txt', '.md')):
+                try:
+                    with open(valor['caminho'], encoding='utf-8-sig') as f:
+                        partes.append(f.read().strip())
+                except Exception as e:
+                    enviar_texto(f"⚠️ Não consegui ler o arquivo ({e}). Mande como texto ou salve em UTF-8.")
+                    continue
+            else:
+                enviar_texto("⚠️ Preciso de texto ou de um arquivo .txt/.md.")
+                continue
+            enviar_texto(f"📥 Parte {len(partes)} recebida ({sum(len(p) for p in partes)} caracteres no total). "
+                         f"Mande mais ou toque em Terminei.", botoes=botoes)
+
+
+# ============================================================
+# Revisão do vídeo pronto, antes de publicar
+# ============================================================
+
+def revisar_video_final_telegram(preview_path, legenda, timeout_min=None):
+    """
+    Manda a PRÉVIA (versão leve, abaixo do limite de 50 MB do Telegram) do vídeo pronto e
+    pergunta se pode publicar. Devolve 'aprovar', 'editar' ou 'parar' (sem resposta; o que
+    o pipeline faz nesse caso vem de 'se_sem_resposta': "parar" é o padrão e NÃO publica).
+    preview_path pode ser None (prévia não coube no limite): a pergunta sai só com texto.
+    config.json -> 'revisao_video_telegram': {"ativo": true, "timeout_resposta_min": 60,
+        "tamanho_maximo_mb": 45, "se_sem_resposta": "parar"}
+    """
+    cfg = _config().get('revisao_video_telegram', {})
+    if not ATIVA_TELEGRAM or not cfg.get('ativo', False):
+        return 'aprovar'
+    if timeout_min is None:
+        timeout_min = int(cfg.get('timeout_resposta_min', 60))
+    sem_resposta = cfg.get('se_sem_resposta', 'parar')
+    botoes = [('✅ Aprovar e publicar', 'aprovar'), ('✏️ Vou editar', 'editar')]
+    limpar_filas_pendentes()
+    if preview_path and os.path.exists(preview_path):
+        try:
+            enviar_video_grande(preview_path, legenda, botoes)
+        except Exception as e:
+            print(f"  ⚠️ Falha ao enviar a prévia ({e}) — perguntando só por texto")
+            enviar_texto(legenda + "\n\n(Não consegui enviar a prévia do vídeo.)", botoes=botoes)
+    else:
+        enviar_texto(legenda + "\n\n(Prévia indisponível — o vídeo completo ficará no artefato da execução.)",
+                     botoes=botoes)
+    while True:
+        tipo, valor = _aguardar_callback_ou_midia(timeout_s=timeout_min * 60)
+        if tipo is None:
+            if sem_resposta == 'publicar':
+                enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — publicando.")
+                return 'aprovar'
+            enviar_texto(f"⏱️ Sem resposta em {timeout_min} min — NÃO publiquei. Vou te mandar os textos pra você postar.")
+            return 'parar'
+        if tipo == 'callback' and valor in ('aprovar', 'editar'):
+            return valor
+
+
+def enviar_video_grande(caminho, legenda, botoes=None):
+    """sendVideo com timeout maior (prévia de ~45 MB)."""
+    params = {'chat_id': TELEGRAM_CHAT_ID, 'caption': legenda[:1024], 'supports_streaming': 'true'}
+    if botoes:
+        params['reply_markup'] = _teclado(botoes)
+    return _enviar_arquivo('sendVideo', 'video', caminho, _timeout=600, **params)
+
+
+def enviar_pacote_edicao(titulo, descricao, tags, thumbnail_path=None, link_execucao=None):
+    """
+    Quando você escolhe "Vou editar": manda tudo o que é preciso pra postar sozinho. Cada
+    texto vai em mensagem SEPARADA (segure o dedo na mensagem pra copiar só aquele).
+    """
+    enviar_texto("✏️ Ok! Não publiquei nada. Pra editar e postar você mesmo:\n\n"
+                 + (f"1) Baixe o vídeo original (em 'Artifacts', no fim da página da execução, "
+                    f"depois que ela terminar — fica 7 dias):\n{link_execucao}\n\n" if link_execucao else
+                    "1) Baixe o vídeo original no artefato da execução (fica 7 dias).\n\n")
+                 + "2) Os textos vêm nas próximas mensagens: título, descrição e tags.")
+    if thumbnail_path and os.path.exists(thumbnail_path):
+        try:
+            enviar_midia(thumbnail_path, "🖼️ Thumbnail aprovada")
+        except Exception:
+            pass
+    enviar_texto_longo(titulo, cabecalho="🏷️ TÍTULO")
+    enviar_texto_longo(descricao, cabecalho="📝 DESCRIÇÃO (com capítulos e hashtags)")
+    enviar_texto_longo(", ".join(tags), cabecalho="🔖 TAGS (cole separadas por vírgula)")
 
 
 def perguntar_base_fechada_telegram(texto, timeout_min=None):
