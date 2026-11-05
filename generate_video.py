@@ -8,6 +8,7 @@ import math
 import signal
 import faulthandler
 import shutil
+import subprocess
 from datetime import datetime
 import requests
 import edge_tts
@@ -32,7 +33,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaFileUpload
 
-from roteiro_engine import gerar_pacote_roteiro
+from roteiro_engine import gerar_pacote_roteiro, montar_pacote_roteiro_proprio, parsear_roteiro_proprio
 import roteiro_engine
 from alinhamento import alinhar_roteiro_com_whisper
 from producao_visual import (
@@ -55,6 +56,8 @@ from telegram_review import (
     escolher_destaques_telegram, revisar_thumbnail_telegram, WorkflowCanceladoPeloUsuario,
     perguntar_audio_customizado_telegram, configurar_tradutor,
     escolher_publicacao_telegram, enviar_texto as telegram_enviar_texto,
+    perguntar_origem_roteiro_telegram, receber_roteiro_telegram,
+    revisar_video_final_telegram, enviar_pacote_edicao,
 )
 
 # ============================================================
@@ -351,6 +354,62 @@ def _traduzir_para_ptbr(textos, com_sugestao=False):
              'sugestao': (sugestoes[i].get('sugestao') or '').strip() or None,
              'busca_en': (sugestoes[i].get('busca_en') or '').strip() or None}
             for i in range(len(textos))]
+
+
+def _ffmpeg_exe():
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return 'ffmpeg'
+
+
+def _duracao_video_ffmpeg(caminho):
+    """Duração em segundos lida do cabeçalho (ffmpeg -i); None se não achar."""
+    r = subprocess.run([_ffmpeg_exe(), '-i', caminho], capture_output=True, text=True)
+    m = re.search(r'Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr or '')
+    return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
+
+
+def gerar_preview_telegram(video_path, tamanho_max_mb=45):
+    """
+    Versão LEVE do vídeo pra caber no Telegram (limite de 50 MB por arquivo pra bots): reduz
+    resolução e bitrate com base na DURAÇÃO, pra ficar abaixo de 'tamanho_max_mb'. Serve pra
+    conferir ritmo, legenda, áudio e cortes — não a qualidade final de imagem (o original
+    vai pro YouTube só depois da sua aprovação). Se o 1º cálculo estourar o limite, refaz
+    com bitrate menor (até 3 tentativas). Devolve o caminho, ou None se não coube.
+    """
+    duracao = _duracao_video_ffmpeg(video_path)
+    if not duracao:
+        print("  ⚠️ Não consegui ler a duração do vídeo — sem prévia")
+        return None
+    os.makedirs('previews', exist_ok=True)   # fora de videos/ pra NÃO subir junto no artefato
+    saida = os.path.join('previews', 'preview.mp4')
+    audio_kbps = 96
+    video_kbps = max(120, int(tamanho_max_mb * 0.90 * 8 * 1024 / duracao) - audio_kbps)
+    for tentativa in range(1, 4):
+        altura = 480 if video_kbps >= 400 else 360 if video_kbps >= 220 else 240
+        cmd = [_ffmpeg_exe(), '-y', '-i', video_path, '-vf', f'scale=-2:{altura}',
+               '-c:v', 'libx264', '-preset', 'veryfast', '-b:v', f'{video_kbps}k',
+               '-maxrate', f'{int(video_kbps * 1.15)}k', '-bufsize', f'{video_kbps * 2}k',
+               '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-b:a', f'{audio_kbps}k', '-ac', '2',
+               '-movflags', '+faststart', saida]
+        print(f"  🎞️ Gerando prévia ({tentativa}/3): {altura}p a ~{video_kbps} kbps...")
+        subprocess.run(cmd, check=True, capture_output=True, timeout=1500)
+        tamanho = os.path.getsize(saida)
+        print(f"     prévia: {tamanho / 1024 / 1024:.1f} MB (limite {tamanho_max_mb} MB)")
+        if tamanho <= tamanho_max_mb * 1024 * 1024:
+            return saida
+        video_kbps = int(video_kbps * 0.75)
+    return None
+
+
+def _url_execucao_github():
+    """Link da página desta execução no GitHub Actions (onde ficam os 'Artifacts')."""
+    repo, run = os.environ.get('GITHUB_REPOSITORY'), os.environ.get('GITHUB_RUN_ID')
+    if not (repo and run):
+        return None
+    return f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/{repo}/actions/runs/{run}"
 
 
 def _extrair_tema_do_briefing(briefing):
@@ -2332,6 +2391,21 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
     else:
         print("  ℹ️ Nenhum CTA encontrado em assets/cta/ — seguindo sem CTA final")
 
+    # Apresentação do narrador (config 'apresentacao_narrador'): vídeo PRONTO (~10 s, com o próprio
+    # áudio) que abre o vídeo, ANTES do primeiro segmento da introdução. Mesma lógica da vinheta
+    # e do CTA: pega o .mp4/.mov da pasta e ajusta ao tamanho do vídeo. Conta na duração total
+    # e nos capítulos da descrição (a "Introdução" continua marcada em 00:00).
+    apresentacao_clip = None
+    cfg_apres = config.get('apresentacao_narrador', {})
+    if cfg_apres.get('ativo', False):
+        apresentacao_clip, apres_path = _carregar_clip_de_pasta(
+            cfg_apres.get('pasta', f'{ASSETS_DIR}/apresentacao'), largura, altura, manter_audio=True)
+        if apresentacao_clip:
+            print(f"  🎙️ Apresentação do narrador: {os.path.basename(apres_path)} ({apresentacao_clip.duration:.1f}s)")
+        else:
+            print(f"  ⚠️ 'apresentacao_narrador' ativo, mas nenhum .mp4/.mov em "
+                  f"{cfg_apres.get('pasta', f'{ASSETS_DIR}/apresentacao')} — seguindo sem apresentação")
+
     duracao_card = float(config.get('duracao_card_capitulo', 7.0))
 
     global CAPITULOS_VIDEO
@@ -2344,6 +2418,9 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
     marco_atual = 0.0  # onde o próximo segmento "começa" pro espectador (no webdoc: no card dele)
 
     clips_finais = []
+    if apresentacao_clip:
+        clips_finais.append(apresentacao_clip)
+        cursor += apresentacao_clip.duration   # entra na conta dos capítulos; a Introdução segue em 00:00
     for i, grupo in enumerate(segmentos):
         fade_in = (i > 0)  # a introdução (i=0) é o próprio início do vídeo — sem fade-in
         clip_segmento = renderizar_segmento_webdoc(grupo, tema, largura, altura, orientacao,
@@ -3050,8 +3127,24 @@ def main():
             print(f"  ⚠️ Falha na escolha de formato via Telegram ({e}) — usando webdoc")
     eh_lista = formato_video.get('formato') == 'lista'
 
+    # Pergunta (só no modo de capítulos) se VOCÊ manda o roteiro pronto ou o Gemini escreve.
+    # Com roteiro próprio, o tema é extraído dele (as perguntas de tema/base fechada não se aplicam).
+    roteiro_proprio_texto = None
+    if ATIVA_TELEGRAM and config.get('modo_roteiro') == 'capitulos_webdoc':
+        try:
+            if perguntar_origem_roteiro_telegram() == 'eu':
+                roteiro_proprio_texto = receber_roteiro_telegram(validar=parsear_roteiro_proprio)
+        except WorkflowCanceladoPeloUsuario:
+            raise
+        except Exception as e:
+            print(f"  ⚠️ Falha na etapa de roteiro próprio via Telegram ({e}) — o Gemini escreve")
+            roteiro_proprio_texto = None
+
     tema = None
-    if ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
+    if roteiro_proprio_texto:
+        tema = _extrair_tema_do_briefing(roteiro_proprio_texto)
+        print(f"  ✍️ Roteiro PRÓPRIO recebido ({len(roteiro_proprio_texto)} caracteres). Tema: {tema}")
+    elif ATIVA_TELEGRAM and config.get('selecao_tema_telegram', {}).get('ativo', False):
         try:
             tema = escolher_tema_telegram()  # None = usuário pediu automático (ou timeout)
         except Exception as e:
@@ -3063,7 +3156,8 @@ def main():
     # fechada", o roteiro só pode usar os fatos desse texto (e uma etapa extra os confere);
     # 'tema' vira uma frase curta (o briefing inteiro não serve de título/busca/log).
     cfg_base = config.get('base_fechada_telegram', {})
-    if ATIVA_TELEGRAM and cfg_base.get('ativo', False) and len(tema) >= int(cfg_base.get('limiar_caracteres', 400)):
+    if (not roteiro_proprio_texto and ATIVA_TELEGRAM and cfg_base.get('ativo', False)
+            and len(tema) >= int(cfg_base.get('limiar_caracteres', 400))):
         try:
             usar_base = perguntar_base_fechada_telegram(tema)
         except Exception as e:
@@ -3075,23 +3169,30 @@ def main():
             tema = _extrair_tema_do_briefing(briefing)
             print(f"  🔒 BASE FECHADA ativa ({len(briefing)} caracteres). Tema: {tema}")
 
-    print("✍️ Gerando roteiro (cadeia: tese → estrutura → escrita → crítica → título/descrição)...")
-    pacote_roteiro = gerar_pacote_roteiro(
-        tema=tema,
-        contexto_nicho=CONTEXTO_NICHO,
-        idioma_conteudo=IDIOMA_CONTEUDO,
-        instrucao_extra=INSTRUCAO_EXTRA_ROTEIRO,
-        documento_estilo=config.get('documento_estilo', []),
-        tipo_video=VIDEO_TYPE,
-        gemini_generate_fn=_gemini_generate,
-        modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
-        num_capitulos=formato_video['num_itens'] if eh_lista else config.get('num_capitulos_webdoc', 3),
-        palavras_alvo_webdoc=config.get('palavras_alvo_webdoc'),
-        formato='lista' if eh_lista else 'webdoc',
-        itens_lista=formato_video.get('itens'),
-        ordem_lista=formato_video.get('ordem', 'regressiva'),
-        notas_lista=formato_video.get('notas'),
-    )
+    if roteiro_proprio_texto:
+        print("📝 Montando o pacote a partir do SEU roteiro (o Gemini só gera título e descrição)...")
+        pacote_roteiro = montar_pacote_roteiro_proprio(
+            roteiro_proprio_texto, tema, CONTEXTO_NICHO, IDIOMA_CONTEUDO, _gemini_generate,
+            formato='lista' if eh_lista else 'webdoc',
+            ordem_lista=formato_video.get('ordem', 'regressiva'))
+    else:
+        print("✍️ Gerando roteiro (cadeia: tese → estrutura → escrita → crítica → título/descrição)...")
+        pacote_roteiro = gerar_pacote_roteiro(
+            tema=tema,
+            contexto_nicho=CONTEXTO_NICHO,
+            idioma_conteudo=IDIOMA_CONTEUDO,
+            instrucao_extra=INSTRUCAO_EXTRA_ROTEIRO,
+            documento_estilo=config.get('documento_estilo', []),
+            tipo_video=VIDEO_TYPE,
+            gemini_generate_fn=_gemini_generate,
+            modo_roteiro=config.get('modo_roteiro', 'cadeia_completa'),
+            num_capitulos=formato_video['num_itens'] if eh_lista else config.get('num_capitulos_webdoc', 3),
+            palavras_alvo_webdoc=config.get('palavras_alvo_webdoc'),
+            formato='lista' if eh_lista else 'webdoc',
+            itens_lista=formato_video.get('itens'),
+            ordem_lista=formato_video.get('ordem', 'regressiva'),
+            notas_lista=formato_video.get('notas'),
+        )
     roteiro = pacote_roteiro['roteiro_texto']
     titulo_video = pacote_roteiro['titulo']
     blocos_roteiro = pacote_roteiro['roteiro_blocos']  # reservado para Fase 2 (B-roll por bloco)
@@ -3325,6 +3426,49 @@ def main():
                 print(f"  ⚠️ Tradução do título/thumb indisponível ({e})")
                 legenda_thumb = f"Título: {titulo_video}\nTexto da thumb: {texto_thumb}"
         thumbnail_path = revisar_thumbnail_telegram(thumbnail_path, legenda_extra=legenda_thumb)
+
+        # Revisão do VÍDEO PRONTO antes de qualquer coisa ir pro YouTube: você recebe uma prévia
+        # leve no Telegram (limite de 50 MB) e escolhe aprovar ou editar por conta própria.
+        # 'editar' (ou sem resposta, com o padrão 'parar') NÃO publica: o workflow termina e te
+        # manda título, descrição (com capítulos e hashtags), tags e o link do vídeo original.
+        cfg_rev = config.get('revisao_video_telegram', {})
+        if ATIVA_TELEGRAM and cfg_rev.get('ativo', False):
+            decisao = 'parar'
+            try:
+                preview = None
+                try:
+                    preview = gerar_preview_telegram(video_path, float(cfg_rev.get('tamanho_maximo_mb', 45)))
+                except Exception as e:
+                    print(f"  ⚠️ Falha ao gerar a prévia ({e}) — a pergunta sai sem o vídeo")
+                dur_video = _duracao_video_ffmpeg(video_path)
+                legenda_rev = (f"🎬 Vídeo pronto: {titulo}"
+                               + (f"\n⏱️ {int(dur_video // 60)}min{int(dur_video % 60):02d}s" if dur_video else "")
+                               + "\n\nÉ uma prévia de qualidade reduzida; o original vai pro YouTube se você aprovar.")
+                decisao = revisar_video_final_telegram(preview, legenda_rev)
+            except WorkflowCanceladoPeloUsuario:
+                raise
+            except Exception as e:
+                print(f"  ⚠️ Falha na revisão do vídeo via Telegram ({e}) — NÃO publicando (lado seguro)")
+            if decisao != 'aprovar':
+                print(f"\n✏️ Revisão: '{decisao}' — vídeo NÃO publicado. Original em {video_path} (artefato da execução).")
+                try:
+                    enviar_pacote_edicao(titulo, descricao, tags, thumbnail_path, _url_execucao_github())
+                except Exception as e:
+                    print(f"  ⚠️ Falha ao enviar o pacote de edição pelo Telegram ({e})")
+                log_file = config.get('arquivo_videos_gerados', 'videos_gerados.json')
+                logs = []
+                if os.path.exists(log_file):
+                    with open(log_file, 'r', encoding='utf-8') as f:
+                        logs = json.load(f)
+                logs.append({'data': datetime.now().isoformat(), 'tipo': VIDEO_TYPE, 'tema': tema,
+                             'titulo': titulo, 'duracao': duracao_narracao, 'video_id': None, 'url': None,
+                             'revisao': decisao})
+                with open(log_file, 'w', encoding='utf-8') as f:
+                    json.dump(logs, f, indent=2, ensure_ascii=False)
+                print("=" * 60)
+                print("✅ WORKFLOW CONCLUÍDO (sem publicação — edição manual)")
+                print("=" * 60)
+                return
 
         publicar_em = None
         try:
