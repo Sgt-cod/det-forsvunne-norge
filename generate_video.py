@@ -1,4 +1,5 @@
 import os
+import inspect
 import json
 import random
 import re
@@ -158,6 +159,37 @@ def _modelo_gemini(nome):
     return _MODELOS_GEMINI[nome]
 
 
+def _chamar_gemini(modelo, prompt):
+    """
+    Uma chamada ao Gemini com timeout MAIOR que o padrão de 60 s da biblioteca.
+    O requirements.txt fixa google-generativeai==0.3.2, que NÃO aceita 'request_options' em
+    generate_content (passar isso dá "ValueError: Unknown field for GenerateContentRequest"),
+    então há dois caminhos:
+      1) biblioteca nova (tem request_options)  → usa a opção oficial;
+      2) biblioteca antiga (0.3.x)              → monta o pedido e chama o cliente de baixo
+         nível com timeout/retry próprios. Se algo nessa montagem não existir na versão
+         instalada, cai na chamada simples (sem timeout maior) em vez de falhar.
+    Erros da API (503, 504, 429...) NÃO são tratados aqui: sobem pro laço de retry.
+    """
+    try:
+        suporta = 'request_options' in inspect.signature(modelo.generate_content).parameters
+    except (TypeError, ValueError):
+        suporta = False
+    if suporta:
+        return modelo.generate_content(prompt, request_options={'retry': None, 'timeout': GEMINI_TIMEOUT_S})
+    try:
+        from google.generativeai import client as _gclient
+        from google.generativeai.types import generation_types as _gtypes
+        pedido = modelo._prepare_request(contents=prompt)
+        if modelo._client is None:
+            modelo._client = _gclient.get_default_generative_client()
+        cliente, classe_resposta = modelo._client, _gtypes.GenerateContentResponse
+    except Exception:
+        return modelo.generate_content(prompt)
+    resposta = cliente.generate_content(pedido, timeout=GEMINI_TIMEOUT_S, retry=None)
+    return classe_resposta.from_response(resposta)
+
+
 def _gemini_generate(prompt, tentativas=5, espera=15):
     """
     Chama o Gemini com retry/backoff. Sem isso, qualquer instabilidade transitória da API
@@ -176,12 +208,7 @@ def _gemini_generate(prompt, tentativas=5, espera=15):
     for tentativa in range(1, tentativas + 1):
         nome = nomes[0] if (tentativa <= 3 or len(nomes) == 1) else nomes[1]
         try:
-            modelo = _modelo_gemini(nome)
-            try:
-                return modelo.generate_content(
-                    prompt, request_options={'retry': None, 'timeout': GEMINI_TIMEOUT_S})
-            except TypeError:
-                return modelo.generate_content(prompt)   # versão antiga da biblioteca, sem request_options
+            return _chamar_gemini(_modelo_gemini(nome), prompt)
         except Exception as e:
             ultimo_erro = e
             print(f"  ⚠️ Erro no Gemini [{nome}] (tentativa {tentativa}/{tentativas}): {e}")
