@@ -426,6 +426,41 @@ def _duracao_video_ffmpeg(caminho):
     return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3)) if m else None
 
 
+def _duracao_real_audio(caminho):
+    """Duração REAL do áudio, medida decodificando o arquivo inteiro com o ffmpeg (o último
+    'time=' do progresso). Diferente da duração do CABEÇALHO, que em mp3 costuma estar 20-50 ms
+    acima do que o arquivo realmente tem. None se não conseguir medir."""
+    try:
+        r = subprocess.run([_ffmpeg_exe(), '-i', caminho, '-f', 'null', '-'],
+                           capture_output=True, text=True, timeout=300)
+        t = re.findall(r'time=(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr or '')
+        if t:
+            h, m, sec = t[-1]
+            return int(h) * 3600 + int(m) * 60 + float(sec)
+    except Exception:
+        pass
+    return None
+
+
+def _carregar_narracao(caminho):
+    """
+    AudioFileClip da narração CORTADO na duração real do áudio.
+
+    Por que: o MoviePy 1.0.3 confia na duração do cabeçalho do mp3, que é 20-50 ms MAIOR que o
+    áudio decodificável (atraso/enchimento do encoder). Quando a montagem pede essas últimas
+    dezenas de ms que não existem, o leitor do MoviePy devolve um pedaço de lixo — um estalo de
+    15-35 ms, alto, logo depois da última palavra, que soa como uma "letra solta" (A, T, V, D).
+    Reproduzido em 24 de 28 testes; com o corte na duração real, 0 de 14.
+    """
+    clip = AudioFileClip(caminho)
+    real = _duracao_real_audio(caminho)
+    if real and real < clip.duration - 0.005:
+        print(f"    🔧 Narração: cabeçalho {clip.duration:.3f}s → real {real:.3f}s "
+              f"(corte de {(clip.duration - real) * 1000:.0f} ms que causava ruído no fim)")
+        clip = clip.subclip(0, real - 0.003)
+    return clip
+
+
 def gerar_preview_telegram(video_path, tamanho_max_mb=45):
     """
     Versão LEVE do vídeo pra caber no Telegram (limite de 50 MB por arquivo pra bots): reduz
@@ -2004,7 +2039,7 @@ def criar_video_curto(audio_path, roteiro, lista_clipes, output_file, duracao_na
     ).set_duration(duracao_total)
     video_base = video_base.fadeout(SEGUNDOS_FADEOUT)
 
-    audio_narr = AudioFileClip(audio_path).set_start(SEGUNDOS_LEAD_IN)
+    audio_narr = _carregar_narracao(audio_path).set_start(SEGUNDOS_LEAD_IN)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=SEGUNDOS_LEAD_IN)
     audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=VOLUME_MUSICA_FUNDO)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
@@ -2099,7 +2134,7 @@ def criar_video_longo(audio_path, roteiro, lista_clipes, output_file, duracao_na
     video_base = CompositeVideoClip(todos_os_clips, size=(1920, 1080)).set_duration(duracao_total)
     video_base = video_base.fadeout(SEGUNDOS_FADEOUT)
 
-    audio_narr = AudioFileClip(audio_path).set_start(offset_narracao)
+    audio_narr = _carregar_narracao(audio_path).set_start(offset_narracao)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx or [], offset=offset_narracao)
     audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_total, volume=VOLUME_MUSICA_FUNDO)
     audio_final = audio_final.audio_fadeout(SEGUNDOS_FADEOUT)
@@ -2175,7 +2210,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
         print(f"    ⚠️ Falha na transcrição do segmento ({e}) — seguindo sem timestamps de palavra")
         palavras_tempo = []
 
-    duracao_segmento = AudioFileClip(audio_path_seg).duration
+    duracao_segmento = _carregar_narracao(audio_path_seg).duration
     blocos_com_tempo_local = mapear_tempos_para_blocos(grupo_blocos, palavras_tempo) if palavras_tempo else []
 
     if not blocos_com_tempo_local:
@@ -2302,7 +2337,7 @@ def renderizar_segmento_webdoc(grupo_blocos, tema, largura, altura, orientacao,
     video_base = CompositeVideoClip(clips_video + clips_legenda + clips_destaque + clips_card_item,
                                      size=(largura, altura)).set_duration(duracao_segmento)
 
-    audio_narr = AudioFileClip(audio_path_seg).set_start(padding_inicio)
+    audio_narr = _carregar_narracao(audio_path_seg).set_start(padding_inicio)
     audio_com_sfx = aplicar_sfx(audio_narr, eventos_sfx, offset=padding_inicio)
     audio_final = _mixar_musica_fundo(audio_com_sfx, duracao_segmento, volume=VOLUME_MUSICA_FUNDO)
 
@@ -3325,7 +3360,7 @@ def main():
         # pós-processamento cego em cima do áudio pronto (ver bugfix no próprio arquivo).
         criar_audio(texto_falado, audio_path)
 
-        audio_clip = AudioFileClip(audio_path)
+        audio_clip = _carregar_narracao(audio_path)
         duracao_narracao = audio_clip.duration
         audio_clip.close()
         print(f"⏱️ {duracao_narracao:.1f}s de narração")
