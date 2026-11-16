@@ -431,7 +431,7 @@ def _duracao_real_audio(caminho):
     'time=' do progresso). Diferente da duração do CABEÇALHO, que em mp3 costuma estar 20-50 ms
     acima do que o arquivo realmente tem. None se não conseguir medir."""
     try:
-        r = subprocess.run([_ffmpeg_exe(), '-i', caminho, '-f', 'null', '-'],
+        r = subprocess.run([_ffmpeg_exe(), '-i', caminho, '-vn', '-f', 'null', '-'],
                            capture_output=True, text=True, timeout=300)
         t = re.findall(r'time=(\d+):(\d+):(\d+(?:\.\d+)?)', r.stderr or '')
         if t:
@@ -442,7 +442,7 @@ def _duracao_real_audio(caminho):
     return None
 
 
-def _carregar_narracao(caminho):
+def _carregar_narracao(caminho, verbose=True):
     """
     AudioFileClip da narração CORTADO na duração real do áudio.
 
@@ -455,9 +455,28 @@ def _carregar_narracao(caminho):
     clip = AudioFileClip(caminho)
     real = _duracao_real_audio(caminho)
     if real and real < clip.duration - 0.005:
-        print(f"    🔧 Narração: cabeçalho {clip.duration:.3f}s → real {real:.3f}s "
-              f"(corte de {(clip.duration - real) * 1000:.0f} ms que causava ruído no fim)")
+        if verbose:
+            print(f"    🔧 Narração: cabeçalho {clip.duration:.3f}s → real {real:.3f}s "
+                  f"(corte de {(clip.duration - real) * 1000:.0f} ms que causava ruído no fim)")
         clip = clip.subclip(0, real - 0.003)
+    return clip
+
+
+def _aparar_audio_do_video(clip, caminho):
+    """
+    Mesmo defeito, em VÍDEO com áudio (apresentação do narrador, CTA, vinheta com som): a
+    faixa de áudio do mp4/mov termina 10-20 ms ANTES da duração do contêiner, o MoviePy lê esse
+    trecho inexistente e solta o estalo no fim do vídeo (reproduzido em 12 de 16 testes; com o
+    corte, 0 de 16). Corta só o ÁUDIO na duração real da faixa; o vídeo não muda.
+    """
+    audio = clip.audio
+    if audio is None:
+        return clip
+    real = _duracao_real_audio(caminho)
+    if real and real < audio.duration - 0.005:
+        print(f"    🔧 {os.path.basename(caminho)}: áudio {audio.duration:.3f}s → real {real:.3f}s (corte de "
+              f"{(audio.duration - real) * 1000:.0f} ms que causava ruído no fim)")
+        clip = clip.set_audio(audio.subclip(0, real - 0.003))
     return clip
 
 
@@ -772,7 +791,7 @@ def criar_audio_fishaudio(texto, output_file):
 
         for tentativa in range(2):
             _chamada_crua_fishaudio(frase, trecho_path)
-            clip_temp = AudioFileClip(trecho_path)
+            clip_temp = _carregar_narracao(trecho_path, verbose=False)
             duracao_real = clip_temp.duration
             clip_temp.close()
 
@@ -788,7 +807,7 @@ def criar_audio_fishaudio(texto, output_file):
         caminhos_trechos.append(trecho_path)
 
     print("  🔗 Concatenando trechos em áudio final...")
-    clips_audio = [AudioFileClip(p) for p in caminhos_trechos]
+    clips_audio = [_carregar_narracao(p, verbose=False) for p in caminhos_trechos]
 
     # BUGFIX (pausa cortando palavra no meio): a versão anterior detectava silêncio no
     # áudio JÁ CONCATENADO por amplitude (pydub) — uma consoante breve ou respiração no
@@ -1983,7 +2002,7 @@ def aplicar_sfx(audio_base, eventos_sfx, offset=0.0, sfx_dir='assets/sfx'):
             # 'destaque' (mouse-click), que já está sincronizado corretamente.
             antecipacao = ANTECIPACAO_SFX_TRANSICAO if evento['tipo'] == 'transicao' else 0.0
             inicio_sfx = max(0.0, offset + evento['tempo'] - antecipacao)
-            sfx_clip = AudioFileClip(arquivo).set_start(inicio_sfx).volumex(0.5)
+            sfx_clip = _carregar_narracao(arquivo, verbose=False).set_start(inicio_sfx).volumex(0.5)
             camadas.append(sfx_clip)
             aplicados += 1
             print(f"    🔊 SFX '{evento['tipo']}' em t={evento['tempo']:.2f}s → {os.path.basename(arquivo)}")
@@ -2459,6 +2478,8 @@ def montar_video_webdoc_por_capitulos(blocos_roteiro, tema, output_file, largura
             clip_bruto = clip_bruto.resize((largura, altura))
         if not manter_audio:
             clip_bruto = clip_bruto.without_audio()
+        else:
+            clip_bruto = _aparar_audio_do_video(clip_bruto, caminho)
         return clip_bruto, caminho
 
     # 'intro_com_audio': true mantém o som original do arquivo da intro (padrão: muda, como
