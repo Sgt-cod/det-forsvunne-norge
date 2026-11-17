@@ -151,6 +151,66 @@ genai.configure(api_key=GEMINI_API_KEY)
 
 
 _MODELOS_GEMINI = {}
+_MODELOS_INDISPONIVEIS = set()   # modelos que devolveram 404 nesta execução (não adianta insistir)
+
+
+class _RespostaGemini:
+    """
+    Envolve a resposta do Gemini pra que '.text' NUNCA falhe com
+    "ValueError: The `response.text` quick accessor only works for simple (single-Part) text
+    responses". Modelos novos podem devolver a resposta em várias partes (por exemplo partes
+    extras de raciocínio/assinatura); a biblioteca fixada (0.3.2) só sabe ler uma parte.
+    Aqui, se o acesso simples falha, juntamos o texto de todas as partes.
+    """
+    def __init__(self, bruta):
+        self._bruta = bruta
+
+    @property
+    def text(self):
+        try:
+            return self._bruta.text
+        except ValueError:
+            textos = []
+            for cand in list(getattr(self._bruta, 'candidates', []))[:1]:
+                for parte in cand.content.parts:
+                    if getattr(parte, 'text', ''):
+                        textos.append(parte.text)
+            return ''.join(textos)
+
+    def __getattr__(self, nome):
+        return getattr(self._bruta, nome)
+
+
+def _listar_modelos_gemini():
+    """Nomes dos modelos que ESTA chave pode usar pra gerar texto (sem o prefixo 'models/')."""
+    try:
+        return sorted(m.name.replace('models/', '') for m in genai.list_models()
+                      if 'generateContent' in getattr(m, 'supported_generation_methods', []))
+    except Exception as e:
+        print(f"  ⚠️ Não consegui listar os modelos do Gemini ({e})")
+        return []
+
+
+def _validar_modelos_gemini():
+    """
+    No começo da execução: confere se o modelo principal e o reserva existem pra ESTA chave
+    (um modelo 'descontinuado pra novos usuários' devolve 404 só quando é chamado, no meio do
+    roteiro). Modelo reserva que não existe é descartado, com aviso — assim ele não gasta as
+    tentativas que seriam do principal. O principal inexistente só gera aviso (o erro de verdade
+    aparecerá na chamada, com a mensagem do Google).
+    """
+    global GEMINI_MODELO_FALLBACK
+    disponiveis = _listar_modelos_gemini()
+    if not disponiveis:
+        return
+    for papel, nome in (('principal', GEMINI_MODELO_PRINCIPAL), ('reserva', GEMINI_MODELO_FALLBACK)):
+        if not nome:
+            continue
+        ok = nome in disponiveis
+        print(f"  🔎 Gemini {papel}: {nome} — {'disponível ✅' if ok else 'NÃO aparece na lista desta chave ❌'}")
+        if not ok and papel == 'reserva':
+            GEMINI_MODELO_FALLBACK = None
+    print("  📋 Modelos de texto disponíveis nesta chave: " + ", ".join(disponiveis))
 
 
 def _modelo_gemini(nome):
@@ -176,7 +236,8 @@ def _chamar_gemini(modelo, prompt):
     except (TypeError, ValueError):
         suporta = False
     if suporta:
-        return modelo.generate_content(prompt, request_options={'retry': None, 'timeout': GEMINI_TIMEOUT_S})
+        return _RespostaGemini(modelo.generate_content(
+            prompt, request_options={'retry': None, 'timeout': GEMINI_TIMEOUT_S}))
     try:
         from google.generativeai import client as _gclient
         from google.generativeai.types import generation_types as _gtypes
@@ -185,9 +246,9 @@ def _chamar_gemini(modelo, prompt):
             modelo._client = _gclient.get_default_generative_client()
         cliente, classe_resposta = modelo._client, _gtypes.GenerateContentResponse
     except Exception:
-        return modelo.generate_content(prompt)
+        return _RespostaGemini(modelo.generate_content(prompt))
     resposta = cliente.generate_content(pedido, timeout=GEMINI_TIMEOUT_S, retry=None)
-    return classe_resposta.from_response(resposta)
+    return _RespostaGemini(classe_resposta.from_response(resposta))
 
 
 def _gemini_generate(prompt, tentativas=5, espera=15):
@@ -206,12 +267,23 @@ def _gemini_generate(prompt, tentativas=5, espera=15):
     nomes = [GEMINI_MODELO_PRINCIPAL] + ([GEMINI_MODELO_FALLBACK] if GEMINI_MODELO_FALLBACK else [])
     ultimo_erro = None
     for tentativa in range(1, tentativas + 1):
-        nome = nomes[0] if (tentativa <= 3 or len(nomes) == 1) else nomes[1]
+        vivos = [n for n in nomes if n not in _MODELOS_INDISPONIVEIS] or nomes
+        nome = vivos[0] if (tentativa <= 3 or len(vivos) == 1) else vivos[1]
         try:
             return _chamar_gemini(_modelo_gemini(nome), prompt)
         except Exception as e:
             ultimo_erro = e
             print(f"  ⚠️ Erro no Gemini [{nome}] (tentativa {tentativa}/{tentativas}): {e}")
+            texto_erro = str(e)
+            if '404' in texto_erro or 'no longer available' in texto_erro or 'is not found' in texto_erro:
+                # modelo inexistente/descontinuado pra esta chave: repetir só gasta tentativas
+                if nome not in _MODELOS_INDISPONIVEIS:
+                    _MODELOS_INDISPONIVEIS.add(nome)
+                    print(f"  ❌ Modelo '{nome}' indisponível pra esta chave — descartado nesta execução. "
+                          f"Modelos que a chave aceita: {', '.join(_listar_modelos_gemini()) or '(não consegui listar)'}")
+                if all(n in _MODELOS_INDISPONIVEIS for n in nomes):
+                    raise
+                continue   # troca de modelo já na próxima tentativa, sem esperar
             if tentativa < tentativas:
                 time.sleep(espera * tentativa)  # backoff progressivo: 15s, 30s, 45s, ...
     raise ultimo_erro
@@ -3224,6 +3296,7 @@ def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=Non
 
 def main():
     print(f"{'📱' if VIDEO_TYPE == 'short' else '🎬'} Iniciando ({VIDEO_TYPE})...")
+    _validar_modelos_gemini()
     os.makedirs(VIDEOS_DIR, exist_ok=True)
     os.makedirs(ASSETS_DIR, exist_ok=True)
 
