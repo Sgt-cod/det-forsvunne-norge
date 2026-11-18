@@ -156,6 +156,58 @@ def aplicar():
     return aplicados
 
 
+# ======================================================================================
+# Patch 2: "letra solta" no FIM do áudio (leitor de áudio do MoviePy 1.0.3)
+# ======================================================================================
+# O defeito: FFMPEG_AudioReader.get_frame, quando o buffer lido é MENOR que o esperado (o que
+# acontece sempre que a leitura chega ao fim do arquivo), aplica este "ajuste" nos índices:
+#
+#     if len(self.buffer) < self.buffersize // 2:
+#         indices = indices - (self.buffersize // 2 - len(self.buffer) + 1)
+#
+# Esse deslocamento só faz sentido se o pedido caísse exatamente no centro do buffer; nos
+# demais casos ele devolve amostras de ANTES — um pedaço da fala/música de dezenas de
+# milissegundos repetido logo depois do fim real do áudio, que soa como uma consoante solta
+# (A, T, V, D). Acontece no fim de qualquer arquivo lido (narração mp3, vídeo do narrador,
+# música), porque a duração do cabeçalho do mp3/mp4 costuma passar do áudio real.
+#
+# A correção na raiz: quando o ffmpeg entrega MENOS do que foi pedido (fim do arquivo), o
+# restante do chunk é preenchido com ZEROS (silêncio). Assim o buffer nunca fica "curto", o
+# ajuste acima nunca dispara, os índices ficam corretos e qualquer pedido além do áudio real
+# devolve silêncio em vez de áudio antigo. Para arquivos que não chegam ao fim, nada muda.
+
+def _read_chunk_com_silencio_no_fim(self, chunksize):
+    import numpy as np
+    chunksize = int(round(chunksize))
+    tamanho_frame = self.nchannels * self.nbytes
+    L = chunksize * tamanho_frame
+    s = self.proc.stdout.read(L)
+    if len(s) < L:
+        s = s[:len(s) - (len(s) % tamanho_frame)] + b'\x00' * (L - (len(s) - (len(s) % tamanho_frame)))
+    dt = {1: 'int8', 2: 'int16', 4: 'int32'}[self.nbytes]
+    resultado = np.frombuffer(s, dtype=dt)
+    resultado = (1.0 * resultado / 2 ** (8 * self.nbytes - 1)).reshape(
+        (int(len(resultado) / self.nchannels), self.nchannels))
+    self.pos = self.pos + chunksize
+    return resultado
+
+
+def aplicar_patch_audio_fim():
+    """Aplica o Patch 2 no leitor de áudio. Idempotente."""
+    try:
+        from moviepy.audio.io import readers as audio_readers
+    except ImportError:
+        return False
+    leitor = audio_readers.FFMPEG_AudioReader
+    if getattr(leitor.read_chunk, '_silencio_no_fim', False):
+        return False
+    _read_chunk_com_silencio_no_fim._silencio_no_fim = True
+    leitor.read_chunk = _read_chunk_com_silencio_no_fim
+    return True
+
+
 _aplicados = aplicar()
 if _aplicados:
     print(f"🩹 Patch anti-deadlock do MoviePy aplicado em: {', '.join(_aplicados)}")
+if aplicar_patch_audio_fim():
+    print("🩹 Patch do fim de áudio do MoviePy aplicado (silêncio em vez de áudio repetido)")
