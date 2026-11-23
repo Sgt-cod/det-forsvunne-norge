@@ -3279,6 +3279,11 @@ def fazer_upload_youtube(video_path, titulo, descricao, tags, thumbnail_path=Non
     if publicar_em is not None:
         body['status']['privacyStatus'] = 'private'
         body['status']['publishAt'] = publicar_em.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+    # Declaração de conteúdo alterado/sintético (o "Uso de IA" em Atributos, no upload manual).
+    # config.json -> 'declarar_conteudo_sintetico': true marca SIM em todo vídeo enviado pelo
+    # pipeline. Campo oficial status.containsSyntheticMedia (YouTube Data API, desde 30/10/2024).
+    if config.get('declarar_conteudo_sintetico', False):
+        body['status']['containsSyntheticMedia'] = True
 
     media = MediaFileUpload(video_path, resumable=True)
     request = youtube.videos().insert(part='snippet,status', body=body, media_body=media)
