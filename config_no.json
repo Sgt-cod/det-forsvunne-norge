@@ -12,6 +12,7 @@
   "voz_fallback": "nb-NO-PernilleNeural",
   "whisper_model_size": "medium",
   "alinhar_whisper_ao_roteiro": true,
+  "abortar_se_roteiro_emergencia": true,
   "usar_fishaudio": false,
   "duracao_pausa_frases_ms": 0,
   "correcoes_pronuncia": {},
