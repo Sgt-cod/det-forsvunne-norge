@@ -362,6 +362,7 @@ roteiro_engine.configurar(
     chars_min=config.get('caracteres_alvo_min'),
     chars_max=config.get('caracteres_alvo_max'),
     chars_por_palavra=config.get('caracteres_por_palavra'),
+    idioma_conteudo=IDIOMA_CONTEUDO,
     abertura_intro=(config.get('abertura_introducao', {}).get('texto', '')
                     if config.get('abertura_introducao', {}).get('ativo', False) else ''),
 )
@@ -3401,6 +3402,21 @@ def main():
               "EMERGÊNCIA (fallback_simples) — a cadeia de capítulos falhou em algum estágio "
               "(veja o traceback impresso mais acima). Por isso a vinheta saiu no início: sem "
               "capitulos_meta, o pipeline usa a montagem antiga.")
+        if config.get('abortar_se_roteiro_emergencia', False):
+            # O vídeo de emergência sai DEGRADADO: sem as perguntas de áudio e de mídia no
+            # Telegram, sem capítulos, com voz automática (às vezes de outro idioma). Melhor parar
+            # e deixar você rodar de novo do que publicar algo assim.
+            aviso = ("⚠️ O roteiro caiu no MODO DE EMERGÊNCIA (a cadeia de capítulos falhou). Parei o "
+                     "workflow pra não produzir um vídeo degradado (sem suas perguntas de áudio/mídia, "
+                     "voz automática, sem capítulos). Rode de novo; se repetir, o estágio que falhou "
+                     "está no log.")
+            print("  🛑 'abortar_se_roteiro_emergencia' ativo — encerrando sem gerar o vídeo.")
+            if ATIVA_TELEGRAM:
+                try:
+                    telegram_enviar_texto(aviso)
+                except Exception:
+                    pass
+            raise SystemExit(1)
 
     # BUGFIX (Wikimedia/Internet Archive nunca sendo tentados): antes, diversidade de
     # mídia era 100% opt-in via 'pesos_fontes_midia' no config.json — mas isso é fácil
