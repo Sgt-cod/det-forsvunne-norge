@@ -51,6 +51,7 @@ _CFG = {
     'chars_min': None,        # alvo de tamanho do roteiro INTEIRO, em caracteres (com espaços)
     'chars_max': None,
     'base_dados': '',         # BASE FECHADA fornecida pelo criador pro vídeo atual (ver definir_base_dados)
+    'idioma_conteudo': '',    # idioma do roteiro (a base fechada pode estar em outro idioma)
     'abertura_intro': '',     # apresentação fixa do canal, inserida no começo da introdução
     'chars_por_palavra': 6.2, # média (com espaço) usada só pra converter alvo de chars em palavras
 }
@@ -63,8 +64,13 @@ def configurar(**kwargs):
             _CFG[k] = v
 
 
+_REGRA_JSON = ("\n- Você responde em JSON: NUNCA use aspas duplas (\") DENTRO do texto narrado — isso quebra o JSON. "
+               "Para citações use « » ou aspas simples (') e não coloque quebras de linha dentro dos textos.")
+
+
 def _regra_numeros():
-    return f"\n- {_CFG['regra_numeros']}" if _CFG['regra_numeros'] else ""
+    base = f"\n- {_CFG['regra_numeros']}" if _CFG['regra_numeros'] else ""
+    return base + _REGRA_JSON
 
 
 def _nota_publico():
@@ -100,6 +106,9 @@ REGRAS DA BASE FECHADA — inegociáveis:
 - Números da base escritos em algarismos podem (e devem, se a regra de números pedir) aparecer
   por extenso no texto, com o MESMO valor.
 - Siga as instruções do criador contidas na base (tom, ângulo, foco, o que evitar).
+- IDIOMA: a base pode estar escrita em OUTRO idioma (ex: português). O texto que você escreve
+  (roteiro, título, descrição) deve ser SEMPRE em {_CFG['idioma_conteudo'] or 'o idioma do canal'}:
+  traduza os fatos da base e NUNCA responda no idioma em que a base foi escrita.
 """
 
 
@@ -212,14 +221,68 @@ def _com_retry_estagio(nome_estagio, func, *args, tentativas=2, **kwargs):
     raise ultimo_erro
 
 
+def _reparar_aspas(texto):
+    """
+    Conserta o defeito mais comum do JSON gerado por LLM: aspas duplas SEM escape dentro de um
+    texto ("ele disse "sim" e saiu") e quebras de linha cruas dentro de strings. Dentro de uma
+    string, uma aspa só FECHA se o próximo caractere não-branco for : , } ou ] — as demais são
+    escapadas. Heurística: não é perfeita, por isso é só a 2ª tentativa (depois do json normal).
+    """
+    saida, em_str, i, n = [], False, 0, len(texto)
+    while i < n:
+        c = texto[i]
+        if em_str and c == '\\' and i + 1 < n:
+            saida.append(c + texto[i + 1]); i += 2; continue
+        if c == '"':
+            if not em_str:
+                em_str = True; saida.append(c)
+            else:
+                j = i + 1
+                while j < n and texto[j] in ' \t\r\n':
+                    j += 1
+                if j >= n or texto[j] in ':,}]':
+                    em_str = False; saida.append(c)
+                else:
+                    saida.append('\\"')
+            i += 1; continue
+        if em_str and c == '\n':
+            saida.append('\\n'); i += 1; continue
+        saida.append(c); i += 1
+    return ''.join(saida)
+
+
 def _extrair_json(texto):
-    """Mesmo padrão já usado em gerar_titulo() no generate_video.py: acha o primeiro { ... }."""
+    """
+    Acha o primeiro { ... } da resposta e faz o parse. Se o JSON vier malformado (aspas
+    duplas dentro do texto, quebra de linha crua, vírgula sobrando), tenta consertar em
+    camadas: (1) parse tolerante a caracteres de controle; (2) _reparar_aspas; (3) a
+    biblioteca json-repair, se instalada. Só levanta erro se tudo falhar — antes, UMA aspa
+    solta num roteiro de 7 mil caracteres derrubava a cadeia inteira (e caía no modo de emergência).
+    """
     texto = texto.strip().replace('```json', '').replace('```', '').strip()
     inicio = texto.find('{')
     fim = texto.rfind('}') + 1
     if inicio == -1 or fim == 0:
         raise ValueError(f"Nenhum JSON encontrado na resposta: {texto[:200]}")
-    return json.loads(texto[inicio:fim])
+    trecho = texto[inicio:fim]
+    try:
+        return json.loads(trecho, strict=False)
+    except json.JSONDecodeError as erro_original:
+        try:
+            r = json.loads(_reparar_aspas(trecho), strict=False)
+            print("  🩹 JSON da resposta consertado (aspas sem escape)")
+            return r
+        except json.JSONDecodeError:
+            pass
+        try:
+            import json_repair
+            r = json_repair.loads(trecho)
+            if isinstance(r, dict) and r:
+                print("  🩹 JSON da resposta consertado (json-repair)")
+                return r
+        except Exception:
+            pass
+        raise erro_original
 
 
 # ============================================================
