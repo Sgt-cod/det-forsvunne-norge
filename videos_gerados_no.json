@@ -88,5 +88,15 @@
     "video_id": "DmINg7TmtKk",
     "url": "https://youtube.com/watch?v=DmINg7TmtKk",
     "agendado_para_utc": "2026-11-23T21:30:00+00:00"
+  },
+  {
+    "data": "2026-11-24T22:51:30.016384",
+    "tipo": "long",
+    "tema": "Det norske oljeparadokset og klimakampen",
+    "titulo": "Svalbard: Hvorfor smelter permafrosten og forgifter drikk...",
+    "duracao": 379.04,
+    "video_id": "svbK4MrmxaU",
+    "url": "https://youtube.com/watch?v=svbK4MrmxaU",
+    "agendado_para_utc": "2026-11-25T13:00:00+00:00"
   }
 ]
