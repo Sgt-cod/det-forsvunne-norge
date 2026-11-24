@@ -35,11 +35,16 @@ jobs:
 
       - name: Liberar política do ImageMagick (necessário para legendas)
         run: |
-          POLICY_FILE="/etc/ImageMagick-6/policy.xml"
-          if [ -f "$POLICY_FILE" ]; then
+          # Procura TODA policy.xml do ImageMagick (6, 7, /usr/local...) em vez de assumir um caminho:
+          # o passo antigo só conhecia /etc/ImageMagick-6 e não fazia nada quando a runner usava outro,
+          # e então TODAS as legendas falhavam com "not allowed by the security policy @/tmp/...".
+          for POLICY_FILE in $(find /etc /usr/local/etc /usr/share -name policy.xml -path '*ImageMagick*' 2>/dev/null); do
+            echo "Liberando $POLICY_FILE"
             sudo sed -i 's/rights="none"/rights="read|write"/g' "$POLICY_FILE"
             sudo sed -i '/pattern="@\*"/d' "$POLICY_FILE"
-          fi
+          done
+          echo "--- política efetiva do ImageMagick (regras de path) ---"
+          (convert -list policy 2>/dev/null || magick -list policy 2>/dev/null) | grep -i -B1 -A2 "domain: Path" || echo "(sem regras de path restritivas)"
 
       - name: Instalar dependências Python
         run: |
